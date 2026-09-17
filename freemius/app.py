@@ -7,7 +7,7 @@ from PyQt6.QtCore import (
     Qt, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint,
 )
 from PyQt6.QtGui import (
-    QAction, QShortcut, QKeySequence,
+    QAction, QShortcut, QKeySequence, QPalette, QColor,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QInputDialog, QLineEdit,
@@ -16,12 +16,13 @@ from PyQt6.QtWidgets import (
 
 from .config import (
     ConnectionStore, load_settings, save_settings,
-    keyring_get, keyring_set, DEFAULT_LOCALHOST_NAME,
+    keyring_get, keyring_set, keyring_delete, DEFAULT_LOCALHOST_NAME,
 )
 from .home_tab import HomeTab
 from .session_tab import TerminalTab
 from .sftp_tab import SftpTab
 from .drawer import Drawer
+from .themes import THEMES, DEFAULT_THEME, get_theme, build_stylesheet
 from .ui_helpers import make_status_icon, ACTIVITY_FG, DEFAULT_FG
 
 
@@ -46,21 +47,13 @@ class MainWindow(QMainWindow):
         self.settings = load_settings()
         self._tab_activity = {}
         self._editing_name = None
+        self.current_theme = self.settings.get("theme", DEFAULT_THEME)
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._on_tab_close_requested)
         self.tabs.currentChanged.connect(self._on_tab_changed)
-        self.tabs.setStyleSheet("""
-            QTabWidget::pane { border: 0; background: #101418; }
-            QTabBar::tab {
-                background: #1b2026; color: #a6adba;
-                padding: 6px 12px; margin-right: 2px;
-                border-top-left-radius: 4px; border-top-right-radius: 4px;
-            }
-            QTabBar::tab:selected { background: #101418; color: #e5e9f0; }
-        """)
 
         self.home = HomeTab(self.store)
         self.home.host_activated.connect(self.open_saved_host)
@@ -68,6 +61,7 @@ class MainWindow(QMainWindow):
         self.home.host_delete.connect(self.delete_saved_host)
         self.home.new_host_clicked.connect(self.open_new_host_drawer)
         self.home.new_sftp_clicked.connect(self.open_sftp_tab)
+        self.home.theme_change_requested.connect(self.apply_theme)
 
         self.home_index = self.tabs.addTab(self.home, self.HOME_TAB_TITLE)
         self.tabs.tabBar().setTabButton(
@@ -84,7 +78,44 @@ class MainWindow(QMainWindow):
 
         self.home.refresh()
         self._install_shortcuts()
+        self.apply_theme(self.current_theme)
 
+    # ---------- темы ----------
+    def apply_theme(self, key: str):
+        if key not in THEMES:
+            key = DEFAULT_THEME
+        self.current_theme = key
+        t = get_theme(key)
+
+        self.setStyleSheet(build_stylesheet(t))
+
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(t["bg"]))
+        pal.setColor(QPalette.ColorRole.WindowText, QColor(t["text"]))
+        pal.setColor(QPalette.ColorRole.Base, QColor(t["bg_alt"]))
+        pal.setColor(QPalette.ColorRole.Text, QColor(t["text"]))
+        pal.setColor(QPalette.ColorRole.Button, QColor(t["panel"]))
+        pal.setColor(QPalette.ColorRole.ButtonText, QColor(t["text"]))
+        self.setPalette(pal)
+
+        self.home.setStyleSheet(f"background-color: {t['bg']};")
+        self._restyle_home_buttons(t)
+
+        self.settings["theme"] = key
+        save_settings(self.settings)
+
+    def _restyle_home_buttons(self, t):
+        h = self.home
+        h.theme_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {t['panel']}; color: {t['text']};
+                border: 1px solid {t['border']}; border-radius: 6px;
+                padding: 8px 16px;
+            }}
+            QPushButton:hover {{ background-color: {t['panel_hov']}; }}
+        """)
+
+    # ---------- геометрия drawer ----------
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.drawer.setGeometry(self.rect())
@@ -93,6 +124,7 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         self.drawer.setGeometry(self.rect())
 
+    # ---------- шорткаты ----------
     def _install_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+T"), self, activated=self.open_new_host_drawer)
         QShortcut(QKeySequence("Ctrl+W"), self, activated=self.close_current_tab)
@@ -113,6 +145,7 @@ class MainWindow(QMainWindow):
         idx = (self.tabs.currentIndex() + delta) % n
         self.tabs.setCurrentIndex(idx)
 
+    # ---------- drawer ----------
     def open_new_host_drawer(self):
         self._editing_name = None
         self.drawer.open_with(save=True)
@@ -150,7 +183,6 @@ class MainWindow(QMainWindow):
             if data["password"]:
                 keyring_set(name, data["password"])
             else:
-                from .config import keyring_delete
                 keyring_delete(name)
             self.home.refresh()
 
@@ -164,6 +196,7 @@ class MainWindow(QMainWindow):
         self._open_session(name, params)
         self.drawer.close_drawer()
 
+    # ---------- сессии ----------
     def open_saved_host(self, name):
         info = self.store.get(name)
         if not info:

@@ -1,5 +1,7 @@
 """Виджет терминала: рисует pyte-экран QPainter-ом."""
 
+import re
+
 import pyte
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect
 from PyQt6.QtGui import (
@@ -42,7 +44,7 @@ class TerminalWidget(QWidget):
         self._sel_start = None
         self._sel_end = None
 
-        # буфер незавершённой строки для потокового фильтра мусора
+        # буфер незавершённой warning-строки
         self._san_buf = b""
 
         self._cursor_visible = True
@@ -81,7 +83,7 @@ class TerminalWidget(QWidget):
         super().resizeEvent(event)
         self._resize_timer.start()
 
-    # ---------- вывод + фильтр ----------
+    # ---------- вывод + фильтр мусора ----------
     def feed(self, data: bytes):
         data = self._sanitize_stream(data)
         if data:
@@ -89,37 +91,41 @@ class TerminalWidget(QWidget):
             self.update()
 
     def _sanitize_stream(self, data: bytes) -> bytes:
-        """Потоковый фильтр мусора: работает с чанками, а не со строками.
+        """Потоковый фильтр: режет warning про setlocale, всё остальное
+        отдаёт в pyte НЕМЕДЛЕННО, без буферизации по строкам.
 
-        bash и sshd могут слать warning «setlocale» и ANSI-мусор кусками,
-        между которыми нет \\n. Поэтому держим накопительный буфер и
-        вырезаем строку целиком, когда она завершится.
+        Это критично для эха ввода — сервер шлёт эхо по одному символу
+        без \\n, и если буферизовать до \\n, ввод не отображается.
         """
         buf = self._san_buf + data
+        self._san_buf = b""
 
-        if b"\n" not in buf:
-            self._san_buf = buf
-            # защита от бесконечного роста, если \n так и не придёт
-            if len(self._san_buf) > 64 * 1024:
-                self._san_buf = self._san_buf[-1024:]
-            return b""
+        # быстрый путь: если warning'а нет — отдаём всё как есть
+        if b"cannot change locale" not in buf and b"setlocale" not in buf:
+            return buf
 
-        lines = buf.split(b"\n")
-        self._san_buf = lines[-1]  # последняя без \n — оставляем до следующего раза
-        out = []
-        for line in lines[:-1]:
-            out.append(self._filter_line(line) + b"\n")
-        return b"".join(out)
+        # медленный путь: вырезаем warning-строки
+        out = re.sub(
+            rb"/bin/bash:\s*warning:\s*setlocale:[^\r\n]*[\r\n]*",
+            b"",
+            buf,
+        )
+        out = re.sub(
+            rb"[^\r\n]*cannot change locale[^\r\n]*[\r\n]*",
+            b"",
+            out,
+        )
 
-    @staticmethod
-    def _filter_line(line: bytes) -> bytes:
-        """Убирает warning-строки про локаль из одной строки."""
-        low = line.lower()
-        if b"cannot change locale" in low:
-            return b""
-        if b"setlocale" in low and b"warning" in low:
-            return b""
-        return line
+        # если на конце висит незакрытый кусок, похожий на начало warning'а,
+        # отложим его до следующего чанка
+        tail = out[-200:] if len(out) > 200 else out
+        if b"setlocale" in tail.lower() and b"\n" not in tail:
+            nl = out.rfind(b"\n")
+            if nl >= 0:
+                self._san_buf = out[nl + 1:]
+                return out[:nl + 1]
+
+        return out
 
     # ---------- палитра ----------
     def _map_color(self, name, bold):

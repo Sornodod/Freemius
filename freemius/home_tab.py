@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .config import DEFAULT_LOCALHOST_NAME
+from .themes import THEMES
 from .ui_helpers import make_status_icon
 
 
@@ -94,6 +95,7 @@ class HomeTab(QWidget):
     host_delete = pyqtSignal(str)
     new_host_clicked = pyqtSignal()
     new_sftp_clicked = pyqtSignal()
+    theme_change_requested = pyqtSignal(str)
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
@@ -121,10 +123,21 @@ class HomeTab(QWidget):
         """)
         sftp_btn.clicked.connect(self.new_sftp_clicked.emit)
 
+        self.theme_btn = QPushButton("🎨 Тема")
+        self.theme_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2b3138; color: #d8dee9; border: none;
+                border-radius: 6px; padding: 8px 16px;
+            }
+            QPushButton:hover { background-color: #3a434e; }
+        """)
+        self.theme_btn.clicked.connect(self._show_theme_menu)
+
         top = QHBoxLayout()
         top.setContentsMargins(24, 20, 24, 0)
         top.addWidget(new_btn)
         top.addWidget(sftp_btn)
+        top.addWidget(self.theme_btn)
         top.addStretch(1)
 
         self.tiles_host = QWidget()
@@ -145,6 +158,16 @@ class HomeTab(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.addLayout(top)
         root.addWidget(scroll, 1)
+
+    def _show_theme_menu(self):
+        menu = QMenu(self)
+        for key, t in THEMES.items():
+            act = QAction(t["name"], self)
+            act.triggered.connect(
+                lambda checked=False, k=key: self.theme_change_requested.emit(k)
+            )
+            menu.addAction(act)
+        menu.exec(self.theme_btn.mapToGlobal(self.theme_btn.rect().bottomLeft()))
 
     def refresh(self):
         while self.tiles_grid.count():
