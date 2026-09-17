@@ -1,12 +1,14 @@
+import getpass
 import json
 import os
 import sys
 from pathlib import Path
 
+import keyring
 import pyte
 from PyQt6.QtCore import (
     Qt, QTimer, pyqtSignal, QObject, QRect, QPropertyAnimation,
-    QEasingCurve, QPoint, QSize,
+    QEasingCurve, QPoint,
 )
 from PyQt6.QtGui import (
     QFont, QFontDatabase, QKeyEvent, QPainter, QColor, QAction,
@@ -15,20 +17,58 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLineEdit, QSpinBox, QPushButton, QLabel,
-    QFormLayout, QMessageBox, QTabWidget,
+    QFormLayout, QMessageBox, QTabWidget, QSplitter, QInputDialog,
     QMenu, QScrollArea, QFrame, QCheckBox, QSizePolicy,
+    QFileDialog, QToolButton,
 )
 
 from ssh_client import SSHClient
+from sftp_panel import FilePanel, transfer_file
+
+
+# ---------- Keyring ----------
+KEYRING_SERVICE = "freemius"
+
+
+def keyring_get(name):
+    try:
+        return keyring.get_password(KEYRING_SERVICE, name)
+    except Exception as e:
+        print(f"[WARN] keyring.get_password({name}): {e}")
+        return None
+
+
+def keyring_set(name, password):
+    try:
+        if password:
+            keyring.set_password(KEYRING_SERVICE, name, password)
+        else:
+            try:
+                keyring.delete_password(KEYRING_SERVICE, name)
+            except keyring.errors.PasswordDeleteError:
+                pass
+    except Exception as e:
+        print(f"[WARN] keyring.set_password({name}): {e}")
+
+
+def keyring_delete(name):
+    try:
+        keyring.delete_password(KEYRING_SERVICE, name)
+    except Exception:
+        pass
 
 
 # ---------- Хранилище подключений ----------
+DEFAULT_LOCALHOST_NAME = "localhost"
+
+
 class ConnectionStore:
     def __init__(self):
         self.path = Path.home() / ".config" / "freemius" / "connections.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data = {}
         self.load()
+        self._ensure_localhost()
 
     def load(self):
         if not self.path.exists():
@@ -65,6 +105,16 @@ class ConnectionStore:
         else:
             self.data = {}
 
+    def _ensure_localhost(self):
+        if DEFAULT_LOCALHOST_NAME not in self.data:
+            self.data[DEFAULT_LOCALHOST_NAME] = {
+                "host": "127.0.0.1",
+                "port": 22,
+                "user": getpass.getuser(),
+                "key": "",
+            }
+            self.save()
+
     def save(self):
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), "utf-8")
@@ -76,9 +126,10 @@ class ConnectionStore:
         self.save()
 
     def remove(self, name):
-        if name in self.data:
+        if name in self.data and name != DEFAULT_LOCALHOST_NAME:
             del self.data[name]
             self.save()
+        keyring_delete(name)
 
     def names(self):
         return sorted(self.data.keys())
@@ -475,6 +526,59 @@ class TerminalTab(QWidget):
         self._set_state("disconnected")
 
 
+# ---------- Вкладка SFTP ----------
+class SftpTab(QWidget):
+    closed = pyqtSignal(object)
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self.store = store
+
+        self.left = FilePanel(store)
+        self.right = FilePanel(store)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self.left)
+        splitter.addWidget(self.right)
+        splitter.setSizes([500, 500])
+
+        self.to_left_btn = QPushButton("◀  Скачать влево")
+        self.to_right_btn = QPushButton("Загрузить вправо  ▶")
+        self.to_left_btn.clicked.connect(self._transfer_to_left)
+        self.to_right_btn.clicked.connect(self._transfer_to_right)
+
+        center = QHBoxLayout()
+        center.setContentsMargins(0, 4, 0, 4)
+        center.addStretch(1)
+        center.addWidget(self.to_left_btn)
+        center.addWidget(self.to_right_btn)
+        center.addStretch(1)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.addWidget(splitter, 1)
+        root.addLayout(center)
+
+        self.left.host_combo.setCurrentIndex(0)
+        self.left._connect_local()
+
+    def _transfer_to_left(self):
+        src, dst = self.right, self.left
+        entry = src.selected_entry()
+        if not entry:
+            return
+        if transfer_file(src, dst, entry):
+            dst.refresh()
+
+    def _transfer_to_right(self):
+        src, dst = self.left, self.right
+        entry = src.selected_entry()
+        if not entry:
+            return
+        if transfer_file(src, dst, entry):
+            dst.refresh()
+
+
 # ---------- Плитка хоста ----------
 class HostTile(QFrame):
     clicked = pyqtSignal(str)
@@ -544,6 +648,7 @@ class HostTile(QFrame):
         act_edit = QAction("Редактировать", self)
         act_edit.triggered.connect(lambda: self.edit_requested.emit(self.name))
         act_del = QAction("Удалить", self)
+        act_del.setEnabled(self.name != DEFAULT_LOCALHOST_NAME)
         act_del.triggered.connect(lambda: self.delete_requested.emit(self.name))
         menu.addAction(act_open)
         menu.addAction(act_edit)
@@ -552,21 +657,19 @@ class HostTile(QFrame):
         menu.exec(global_pos)
 
 
-# ---------- Домашняя вкладка (плитки) ----------
+# ---------- Домашняя вкладка ----------
 class HomeTab(QWidget):
-    """Отдельная вкладка с плитками сохранённых хостов."""
-
     host_activated = pyqtSignal(str)
     host_edit = pyqtSignal(str)
     host_delete = pyqtSignal(str)
     new_host_clicked = pyqtSignal()
+    new_sftp_clicked = pyqtSignal()
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
         self.store = store
         self.setStyleSheet("background-color: #101418;")
 
-        # Кнопка "Новый хост" сверху
         new_btn = QPushButton("+ Новый хост")
         new_btn.setStyleSheet("""
             QPushButton {
@@ -578,12 +681,22 @@ class HomeTab(QWidget):
         """)
         new_btn.clicked.connect(self.new_host_clicked.emit)
 
+        sftp_btn = QPushButton("SFTP сессия")
+        sftp_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2b3138; color: #d8dee9; border: none;
+                border-radius: 6px; padding: 8px 16px;
+            }
+            QPushButton:hover { background-color: #3a434e; }
+        """)
+        sftp_btn.clicked.connect(self.new_sftp_clicked.emit)
+
         top = QHBoxLayout()
         top.setContentsMargins(24, 20, 24, 0)
         top.addWidget(new_btn)
+        top.addWidget(sftp_btn)
         top.addStretch(1)
 
-        # Скроллируемая область с плитками
         self.tiles_host = QWidget()
         self.tiles_grid = QGridLayout(self.tiles_host)
         self.tiles_grid.setContentsMargins(24, 20, 24, 24)
@@ -616,7 +729,6 @@ class HomeTab(QWidget):
             self.tiles_grid.addWidget(empty, 0, 0)
             return
 
-        # Автоматическое количество колонок по ширине
         cols = self._column_count()
         for i, name in enumerate(names):
             info = self.store.get(name)
@@ -625,29 +737,91 @@ class HomeTab(QWidget):
             tile.edit_requested.connect(self.host_edit.emit)
             tile.delete_requested.connect(self.host_delete.emit)
             self.tiles_grid.addWidget(tile, i // cols, i % cols)
-
-        # растянуть колонки равномерно
         for c in range(cols):
             self.tiles_grid.setColumnStretch(c, 1)
 
     def _column_count(self):
-        # ширину окна делим на ~260px на плитку
         w = self.width() or 1200
         return max(1, (w - 48) // 260)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Перестраиваем сетку при заметном изменении ширины
         new_cols = self._column_count()
         if getattr(self, "_last_cols", None) != new_cols:
             self._last_cols = new_cols
             self.refresh()
 
 
+# ---------- Выбор ключа ----------
+def _list_ssh_keys():
+    """Файлы в ~/.ssh, которые похожи на приватные ключи."""
+    ssh_dir = Path.home() / ".ssh"
+    if not ssh_dir.is_dir():
+        return []
+    skip = {"known_hosts", "known_hosts.old", "config", "authorized_keys"}
+    keys = []
+    for p in sorted(ssh_dir.iterdir()):
+        if not p.is_file():
+            continue
+        if p.name in skip:
+            continue
+        if p.suffix == ".pub":
+            continue
+        if p.name.endswith(".old"):
+            continue
+        keys.append(str(p))
+    return keys
+
+
+class KeyPickerButton(QToolButton):
+    """Кнопка «…» — меню с ключами из ~/.ssh + «Другой файл…»."""
+
+    key_selected = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setText("…")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet("""
+            QToolButton {
+                background-color: #2b3138; color: #d8dee9;
+                border: none; border-radius: 4px; padding: 2px 8px;
+            }
+            QToolButton:hover { background-color: #3a434e; }
+        """)
+        self.clicked.connect(self._show_menu)
+
+    def _show_menu(self):
+        menu = QMenu(self)
+        keys = _list_ssh_keys()
+        if keys:
+            for k in keys:
+                act = QAction(Path(k).name, self)
+                act.setToolTip(k)
+                act.triggered.connect(lambda checked=False, path=k: self.key_selected.emit(path))
+                menu.addAction(act)
+        else:
+            act = QAction("(нет ключей в ~/.ssh)", self)
+            act.setEnabled(False)
+            menu.addAction(act)
+        menu.addSeparator()
+        act_other = QAction("Другой файл…", self)
+        act_other.triggered.connect(self._pick_file)
+        menu.addAction(act_other)
+        menu.exec(self.mapToGlobal(self.rect().bottomLeft()))
+
+    def _pick_file(self):
+        start = str(Path.home() / ".ssh")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать ключ", start, "Все файлы (*)"
+        )
+        if path:
+            self.key_selected.emit(path)
+
+
 # ---------- Drawer ----------
 class Drawer(QWidget):
     submitted = pyqtSignal(dict)
-    cancelled = pyqtSignal()
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -677,8 +851,19 @@ class Drawer(QWidget):
         self.user_edit = QLineEdit()
         self.pass_edit = QLineEdit()
         self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pass_edit.setPlaceholderText("Пароль SSH")
+
+        # ключ: QLineEdit + кнопка "…"
         self.key_edit = QLineEdit()
         self.key_edit.setPlaceholderText("~/.ssh/id_ed25519 (опционально)")
+        self.key_btn = KeyPickerButton()
+        self.key_btn.key_selected.connect(self.key_edit.setText)
+
+        key_row = QHBoxLayout()
+        key_row.setContentsMargins(0, 0, 0, 0)
+        key_row.setSpacing(4)
+        key_row.addWidget(self.key_edit, 1)
+        key_row.addWidget(self.key_btn)
 
         self.save_check = QCheckBox("Сохранить в список")
         self.save_check.setChecked(True)
@@ -690,7 +875,7 @@ class Drawer(QWidget):
         form.addRow("Порт:", self.port_spin)
         form.addRow("Пользователь:", self.user_edit)
         form.addRow("Пароль:", self.pass_edit)
-        form.addRow("Ключ:", self.key_edit)
+        form.addRow("Ключ:", key_row)
 
         title = QLabel("Новое подключение")
         f = title.font()
@@ -699,7 +884,7 @@ class Drawer(QWidget):
         title.setFont(f)
         title.setStyleSheet("color: #e5e9f0;")
 
-        hint = QLabel("Пароль не сохраняется на диск.")
+        hint = QLabel("Пароль хранится в системном keyring.")
         hint.setStyleSheet("color: #7f8a99; font-size: 11px;")
 
         btn_ok = QPushButton("Подключиться")
@@ -747,12 +932,15 @@ class Drawer(QWidget):
         if self.isVisible() and not self._anim.state():
             self.panel.move(self.width() - self._width, 0)
 
-    def open_with(self, name="", host="", port=22, user="", key="", save=True):
+    def open_with(self, name="", host="", port=22, user="", key="",
+                  password="", save=True):
         self.name_edit.setText(name)
         self.host_edit.setText(host)
         self.port_spin.setValue(port)
         self.user_edit.setText(user)
-        self.pass_edit.clear()
+        # пароль показываем как есть (не точками) — по запросу
+        self.pass_edit.setEchoMode(QLineEdit.EchoMode.Normal)
+        self.pass_edit.setText(password or "")
         self.key_edit.setText(key or "")
         self.save_check.setChecked(save)
         self.show()
@@ -803,7 +991,6 @@ class Drawer(QWidget):
         })
 
     def _on_cancel(self):
-        self.cancelled.emit()
         self.close_drawer()
 
 
@@ -818,8 +1005,8 @@ class MainWindow(QMainWindow):
 
         self.store = ConnectionStore()
         self._tab_activity = {}
+        self._editing_name = None  # имя редактируемого хоста (для Drawer)
 
-        # Табы
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
@@ -835,28 +1022,25 @@ class MainWindow(QMainWindow):
             QTabBar::tab:selected { background: #101418; color: #e5e9f0; }
         """)
 
-        # Домашняя вкладка
         self.home = HomeTab(self.store)
         self.home.host_activated.connect(self.open_saved_host)
         self.home.host_edit.connect(self.edit_saved_host)
         self.home.host_delete.connect(self.delete_saved_host)
         self.home.new_host_clicked.connect(self.open_new_host_drawer)
+        self.home.new_sftp_clicked.connect(self.open_sftp_tab)
 
         self.home_index = self.tabs.addTab(self.home, self.HOME_TAB_TITLE)
-        # убрать крестик с домашней вкладки
         self.tabs.tabBar().setTabButton(self.home_index, self.tabs.tabBar().ButtonPosition.RightSide, None)
         self.tabs.tabBar().setTabButton(self.home_index, self.tabs.tabBar().ButtonPosition.LeftSide, None)
 
         self.setCentralWidget(self.tabs)
 
-        # Drawer
         self.drawer = Drawer(self)
         self.drawer.submitted.connect(self._on_drawer_submit)
 
         self.home.refresh()
         self._install_shortcuts()
 
-    # --- геометрия drawer ---
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.drawer.setGeometry(self.rect())
@@ -865,7 +1049,6 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         self.drawer.setGeometry(self.rect())
 
-    # --- шорткаты ---
     def _install_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+T"), self, activated=self.open_new_host_drawer)
         QShortcut(QKeySequence("Ctrl+W"), self, activated=self.close_current_tab)
@@ -886,23 +1069,33 @@ class MainWindow(QMainWindow):
         idx = (self.tabs.currentIndex() + delta) % n
         self.tabs.setCurrentIndex(idx)
 
-    # --- drawer ---
     def open_new_host_drawer(self):
+        self._editing_name = None
         self.drawer.open_with(save=True)
 
     def edit_saved_host(self, name):
         info = self.store.get(name) or {}
+        password = keyring_get(name) or ""
+        self._editing_name = name
         self.drawer.open_with(
             name=name,
             host=info.get("host", ""),
             port=int(info.get("port", 22)),
             user=info.get("user", ""),
             key=info.get("key", ""),
+            password=password,
             save=True,
         )
 
     def _on_drawer_submit(self, data):
         name = data["name"]
+        old_name = self._editing_name
+        self._editing_name = None
+
+        # если при редактировании переименовали — удалим старое
+        if old_name and old_name != name:
+            self.store.remove(old_name)
+
         if data["save"]:
             self.store.add(
                 name=name,
@@ -911,6 +1104,11 @@ class MainWindow(QMainWindow):
                 user=data["user"],
                 key=data["key"] or "",
             )
+            # пароль в keyring
+            if data["password"]:
+                keyring_set(name, data["password"])
+            else:
+                keyring_delete(name)
             self.home.refresh()
 
         params = {
@@ -923,7 +1121,6 @@ class MainWindow(QMainWindow):
         self._open_session(name, params)
         self.drawer.close_drawer()
 
-    # --- открытие сессии ---
     def open_saved_host(self, name):
         info = self.store.get(name)
         if not info:
@@ -935,6 +1132,23 @@ class MainWindow(QMainWindow):
             "password": None,
             "key": info.get("key") or None,
         }
+        # если нет ключа — тянем пароль из keyring
+        if not params["key"]:
+            password = keyring_get(name)
+            if not password:
+                password, ok = QInputDialog.getText(
+                    self, "Пароль SSH",
+                    f"Пароль для {params['user']}@{params['host']}:",
+                    QLineEdit.EchoMode.Password,
+                )
+                if not ok:
+                    return
+                password = password or None
+                # если пользователь ввёл пароль — предложим запомнить?
+                # (просто сохраняем в keyring на будущее)
+                if password:
+                    keyring_set(name, password)
+            params["password"] = password
         self._open_session(name, params)
 
     def _open_session(self, display_name, params):
@@ -949,11 +1163,16 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(idx)
         tab.start()
 
-    # --- управление табами ---
+    def open_sftp_tab(self):
+        tab = SftpTab(self.store)
+        idx = self.tabs.addTab(tab, "SFTP")
+        self.tabs.setTabIcon(idx, make_status_icon("connected"))
+        self.tabs.setCurrentIndex(idx)
+
     def close_current_tab(self):
         idx = self.tabs.currentIndex()
         if idx <= self.home_index:
-            return  # домашнюю не закрываем
+            return
         self._on_tab_close_requested(idx)
 
     def _on_tab_close_requested(self, idx):
@@ -972,10 +1191,16 @@ class MainWindow(QMainWindow):
             if tab.ssh:
                 tab.ssh.disconnect()
                 tab.ssh = None
+        elif isinstance(tab, SftpTab):
+            for p in (tab.left, tab.right):
+                if p.provider:
+                    try:
+                        p.provider.close()
+                    except Exception:
+                        pass
         self._tab_activity.pop(id(tab), None)
         self.tabs.removeTab(idx)
         tab.deleteLater()
-        # индекс домашней вкладки мог сдвинуться — обновим
         self.home_index = self.tabs.indexOf(self.home)
 
     def _on_tab_closed(self, tab):
@@ -1019,13 +1244,15 @@ class MainWindow(QMainWindow):
             self._update_tab_title(tab)
             tab.terminal.setFocus()
 
-    # --- удаление плитки ---
     def delete_saved_host(self, name):
+        if name == DEFAULT_LOCALHOST_NAME:
+            QMessageBox.information(self, "Нельзя удалить", "localhost — предустановленный хост.")
+            return
         if QMessageBox.question(
             self, "Удалить", f"Удалить «{name}» из сохранённых?"
         ) != QMessageBox.StandardButton.Yes:
             return
-        self.store.remove(name)
+        self.store.remove(name)   # внутри вызывает keyring_delete
         self.home.refresh()
 
     def closeEvent(self, event):
@@ -1034,6 +1261,13 @@ class MainWindow(QMainWindow):
             if isinstance(tab, TerminalTab) and tab.ssh:
                 tab.ssh.disconnect()
                 tab.ssh = None
+            elif isinstance(tab, SftpTab):
+                for p in (tab.left, tab.right):
+                    if p.provider:
+                        try:
+                            p.provider.close()
+                        except Exception:
+                            pass
         event.accept()
 
 

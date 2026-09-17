@@ -33,17 +33,33 @@ class SSHClient:
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
+        # Логика аутентификации:
+        #   - есть ключ  → только ключ (+ пароль, если это passphrase)
+        #   - есть пароль→ только пароль
+        #   - ничего     → ищем ключи в ~/.ssh, но БЕЗ ssh-agent
+        # Если позволить paramiko перебирать все ключи + агент,
+        # sshd часто рвёт соединение с "Too many authentication failures".
+        kwargs = dict(
+            hostname=host,
+            port=port,
+            username=username,
+            timeout=10,
+        )
+        if key_filename:
+            kwargs["key_filename"] = key_filename
+            kwargs["password"] = password or None
+            kwargs["look_for_keys"] = False
+            kwargs["allow_agent"] = False
+        elif password:
+            kwargs["password"] = password
+            kwargs["look_for_keys"] = False
+            kwargs["allow_agent"] = False
+        else:
+            kwargs["look_for_keys"] = True
+            kwargs["allow_agent"] = False  # без агента!
+
         try:
-            self.client.connect(
-                hostname=host,
-                port=port,
-                username=username,
-                password=password,
-                key_filename=key_filename or None,
-                look_for_keys=True,
-                allow_agent=True,
-                timeout=10,
-            )
+            self.client.connect(**kwargs)
         except paramiko.AuthenticationException as e:
             log.error(f"Аутентификация не удалась: {e}")
             raise
