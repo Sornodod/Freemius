@@ -1,13 +1,13 @@
 """SCP-провайдер: использует системный scp/ssh, обходит SFTP-подсистему.
 
-Работает и по ключу, и по паролю (через sshpass).
-Позволяет листинг, копирование в обе стороны, mkdir, rm.
+Пароль передаётся через SSH_ASKPASS — без sshpass.
+Работает и по ключу, и по паролю.
 """
 
 import os
 import shutil
-import stat as stat_module
 import subprocess
+import tempfile
 import time
 
 
@@ -35,42 +35,83 @@ class SCPProvider:
         self.password = password or None
         self.key = key or None
 
-        if self.password and not self.key and not _which("sshpass"):
-            raise RuntimeError(
-                "Для подключения по паролю нужен `sshpass`.\n"
-                "Установи: sudo apt install sshpass\n"
-                "Или укажи путь к ключу при редактировании хоста."
-            )
-
         self.cwd = self._remote_pwd()
 
-    # --- низкоуровневое ---
-    def _ssh_base(self):
-        cmd = ["ssh", "-p", str(self.port), "-o", "LogLevel=ERROR",
-               "-o", "StrictHostKeyChecking=accept-new"]
+    # --- аутентификация ---
+    def _auth_opts(self):
+        """Общие опции аутентификации для ssh/scp.
+
+        Явно указываем, каким способом аутентифицироваться, чтобы OpenSSH
+        не перебирал все ключи из ~/.ssh и агента — иначе sshd может
+        ответить 'Too many authentication failures'.
+        """
+        opts = [
+            "-o", "LogLevel=ERROR",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "NumberOfPasswordPrompts=1",
+            "-o", "IdentitiesOnly=yes",
+        ]
         if self.key:
-            cmd += ["-i", self.key, "-o", "IdentitiesOnly=yes"]
-        return cmd
+            opts += [
+                "-i", self.key,
+                "-o", "PreferredAuthentications=publickey",
+                "-o", "PubkeyAuthentication=yes",
+                "-o", "PasswordAuthentication=no",
+                "-o", "KbdInteractiveAuthentication=no",
+            ]
+        elif self.password:
+            opts += [
+                "-o", "PreferredAuthentications=password,keyboard-interactive",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "PasswordAuthentication=yes",
+                "-o", "KbdInteractiveAuthentication=yes",
+                "-o", "IdentityAgent=none",
+            ]
+        return opts
+
+    def _ssh_base(self):
+        return ["ssh", "-p", str(self.port)] + self._auth_opts()
 
     def _scp_base(self):
-        cmd = ["scp", "-O", "-P", str(self.port), "-o", "LogLevel=ERROR",
-               "-o", "StrictHostKeyChecking=accept-new"]
-        if self.key:
-            cmd += ["-i", self.key, "-o", "IdentitiesOnly=yes"]
-        return cmd
+        return ["scp", "-O", "-P", str(self.port)] + self._auth_opts()
 
-    def _wrap(self, cmd):
-        if self.password and not self.key:
-            return ["sshpass", "-p", self.password] + cmd
-        return cmd
+    # --- SSH_ASKPASS ---
+    def _askpass_env(self):
+        if not self.password:
+            return None, None
+
+        fd, path = tempfile.mkstemp(prefix="freemius_askpass_", suffix=".sh")
+        with os.fdopen(fd, "w") as f:
+            f.write("#!/bin/sh\n")
+            safe = self.password.replace("'", "'\"'\"'")
+            f.write(f"printf '%s\\n' '{safe}'\n")
+        os.chmod(path, 0o700)
+
+        env = os.environ.copy()
+        env["SSH_ASKPASS"] = path
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env.setdefault("DISPLAY", ":0")
+        return env, path
 
     def _run(self, cmd, timeout=60, check=False):
+        env, askpass_path = self._askpass_env()
         try:
             p = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError("Таймаут команды")
+        finally:
+            if askpass_path:
+                try:
+                    os.unlink(askpass_path)
+                except Exception:
+                    pass
         if check and p.returncode != 0:
             raise RuntimeError(p.stderr.strip() or f"exit code {p.returncode}")
         return p
@@ -82,7 +123,7 @@ class SCPProvider:
         return "'" + s.replace("'", "'\"'\"'") + "'"
 
     def _remote_pwd(self):
-        cmd = self._wrap(self._ssh_base() + [self._remote(), "pwd"])
+        cmd = self._ssh_base() + [self._remote(), "pwd"]
         p = self._run(cmd, check=True)
         for line in p.stdout.splitlines():
             line = line.strip()
@@ -93,9 +134,7 @@ class SCPProvider:
     # --- публичный API ---
     def listdir(self):
         remote = self._remote()
-        cmd = self._wrap(self._ssh_base() + [
-            remote, f"ls -la {self._quote(self.cwd)}"
-        ])
+        cmd = self._ssh_base() + [remote, f"ls -la {self._quote(self.cwd)}"]
         p = self._run(cmd, check=True)
 
         entries = []
@@ -158,10 +197,10 @@ class SCPProvider:
                 parts.append(p)
         normalized = "/" + "/".join(parts)
 
-        cmd = self._wrap(self._ssh_base() + [
+        cmd = self._ssh_base() + [
             self._remote(),
             f"cd {self._quote(normalized)} && pwd",
-        ])
+        ]
         p = self._run(cmd, check=True)
         for line in p.stdout.splitlines():
             line = line.strip()
@@ -178,27 +217,27 @@ class SCPProvider:
             self.cwd = parent
 
     def mkdir(self, name):
-        cmd = self._wrap(self._ssh_base() + [
+        cmd = self._ssh_base() + [
             self._remote(),
             f"mkdir {self._quote(self.cwd.rstrip('/') + '/' + name)}",
-        ])
+        ]
         self._run(cmd, check=True)
 
     def remove(self, entry):
-        cmd = self._wrap(self._ssh_base() + [
+        cmd = self._ssh_base() + [
             self._remote(),
             f"rm -rf {self._quote(entry.path)}",
-        ])
+        ]
         self._run(cmd, check=True)
 
     def get_file(self, remote_path, local_path):
         src = f"{self._remote()}:{remote_path}"
-        cmd = self._wrap(self._scp_base() + [src, local_path])
+        cmd = self._scp_base() + [src, local_path]
         self._run(cmd, timeout=600, check=True)
 
     def put_file(self, local_path, remote_path):
         dst = f"{self._remote()}:{remote_path}"
-        cmd = self._wrap(self._scp_base() + [local_path, dst])
+        cmd = self._scp_base() + [local_path, dst]
         self._run(cmd, timeout=600, check=True)
 
     def open_read(self, path):

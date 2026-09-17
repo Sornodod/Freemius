@@ -198,16 +198,9 @@ class _HostPicker(QWidget):
             if w:
                 w.deleteLater()
 
-        local_tile = _HostChoiceTile(
-            "Local (этот компьютер)", os.path.expanduser("~"), is_local=True
-        )
-        local_tile.mouseReleaseEvent = (
-            lambda ev, t=local_tile: self._on_choose("__local__", None)
-        )
-        self.tiles_grid.addWidget(local_tile, 0, 0)
 
         names = self.store.names()
-        for i, name in enumerate(names, start=1):
+        for i, name in enumerate(names, start=0):
             info = self.store.get(name) or {}
             user = info.get("user", "") or ""
             host = info.get("host", "")
