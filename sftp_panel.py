@@ -1,17 +1,30 @@
-"""Панель файлового менеджера: локальная ФС или удалённая по SFTP."""
+"""Панель файлового менеджера: сначала выбор хоста плитками, потом файлы."""
 
 import os
 import stat as stat_module
 import time
 
-import paramiko
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, QEvent, QMimeData, pyqtSignal
+from PyQt6.QtGui import QColor, QDrag
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QPushButton,
-    QListWidget, QListWidgetItem, QLabel, QInputDialog,
-    QMessageBox, QAbstractItemView, QLineEdit,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget,
+    QPushButton, QListWidget, QListWidgetItem, QLabel,
+    QInputDialog, QMessageBox, QAbstractItemView, QLineEdit,
+    QFrame, QScrollArea, QSizePolicy,
 )
+
+from scp_provider import SCPProvider
+
+
+KEYRING_SERVICE = "freemius"
+
+
+def _keyring_get(name):
+    try:
+        import keyring
+        return keyring.get_password(KEYRING_SERVICE, name)
+    except Exception:
+        return None
 
 
 def _human_size(n):
@@ -95,105 +108,146 @@ class LocalProvider:
         return f"Local: {self.cwd}"
 
 
-# ---------- SFTP-провайдер ----------
-class SFTPProvider:
-    kind = "sftp"
+# ---------- Плитка хоста ----------
+class _HostChoiceTile(QFrame):
+    def __init__(self, title, subtitle, is_local=False, parent=None):
+        super().__init__(parent)
+        self.setObjectName("HostChoiceTile")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(64)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet("""
+            #HostChoiceTile {
+                background-color: #1b2026;
+                border: 1px solid #2b3138;
+                border-radius: 8px;
+            }
+            #HostChoiceTile:hover {
+                background-color: #232a32;
+                border: 1px solid #3f4a55;
+            }
+        """)
 
-    def __init__(self, host, port, user, password=None, key=None):
-        self.ssh = paramiko.SSHClient()
-        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        dot_color = "#88c0d0" if is_local else "#3fa64a"
+        dot = QLabel()
+        dot.setFixedSize(10, 10)
+        dot.setStyleSheet(f"background-color: {dot_color}; border-radius: 5px;")
 
-        # См. ssh_client.py — та же логика, чтобы не ловить
-        # "Too many authentication failures".
-        kwargs = dict(hostname=host, port=port, username=user, timeout=10)
-        if key:
-            kwargs["key_filename"] = key
-            kwargs["password"] = password or None
-            kwargs["look_for_keys"] = False
-            kwargs["allow_agent"] = False
-        elif password:
-            kwargs["password"] = password
-            kwargs["look_for_keys"] = False
-            kwargs["allow_agent"] = False
-        else:
-            kwargs["look_for_keys"] = True
-            kwargs["allow_agent"] = True
+        self.title_label = QLabel(title)
+        f = self.title_label.font()
+        f.setPointSize(10)
+        f.setBold(True)
+        self.title_label.setFont(f)
+        self.title_label.setStyleSheet("color: #e5e9f0; background: transparent;")
 
-        self.ssh.connect(**kwargs)
-        self.sftp = self.ssh.open_sftp()
-        try:
-            self.cwd = self.sftp.normalize(".")
-        except Exception:
-            self.cwd = "."
+        self.sub_label = QLabel(subtitle)
+        self.sub_label.setStyleSheet("color: #7f8a99; background: transparent;")
 
-    def listdir(self):
-        entries = []
-        for attr in self.sftp.listdir_attr(self.cwd):
-            is_dir = stat_module.S_ISDIR(attr.st_mode or 0)
-            full = self.cwd.rstrip("/") + "/" + attr.filename
-            entries.append(FileEntry(
-                attr.filename, is_dir, attr.st_size, attr.st_mtime, full
-            ))
-        entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
-        return entries
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(1)
+        text_col.addWidget(self.title_label)
+        text_col.addWidget(self.sub_label)
 
-    def chdir(self, path):
-        try:
-            self.cwd = self.sftp.normalize(path)
-        except Exception:
-            self.cwd = path
-
-    def cd_up(self):
-        parent = self.cwd.rstrip("/").rsplit("/", 1)[0] or "/"
-        self.chdir(parent)
-
-    def mkdir(self, name):
-        self.sftp.mkdir(self.cwd.rstrip("/") + "/" + name)
-
-    def remove(self, entry: FileEntry):
-        if entry.is_dir:
-            self.sftp.rmdir(entry.path)
-        else:
-            self.sftp.remove(entry.path)
-
-    def open_read(self, path):
-        return self.sftp.open(path, "rb")
-
-    def open_write(self, path):
-        return self.sftp.open(path, "wb")
-
-    def close(self):
-        try:
-            self.sftp.close()
-        except Exception:
-            pass
-        try:
-            self.ssh.close()
-        except Exception:
-            pass
-
-    def label(self):
-        return f"SFTP: {self.cwd}"
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 8, 10, 8)
+        row.addWidget(dot, 0, Qt.AlignmentFlag.AlignTop)
+        row.addSpacing(6)
+        row.addLayout(text_col, 1)
 
 
-# ---------- Виджет панели ----------
-class FilePanel(QWidget):
-    def __init__(self, store, parent=None):
+# ---------- Страница выбора хоста ----------
+class _HostPicker(QWidget):
+    def __init__(self, store, on_choose, parent=None):
         super().__init__(parent)
         self.store = store
-        self.provider = None
+        self._on_choose = on_choose
+        self.setStyleSheet("background-color: #101418;")
 
-        self.host_combo = QComboBox()
-        self.host_combo.addItem("Local (этот компьютер)", "__local__")
-        for name in self.store.names():
-            self.host_combo.addItem(name, name)
+        header = QLabel("Выберите хост")
+        f = header.font()
+        f.setPointSize(12)
+        f.setBold(True)
+        header.setFont(f)
+        header.setStyleSheet("color: #e5e9f0; padding: 6px 4px 0 4px;")
 
-        self.connect_btn = QPushButton("Подключить")
-        self.connect_btn.clicked.connect(self._on_connect_clicked)
+        self.tiles_host = QWidget()
+        self.tiles_grid = QGridLayout(self.tiles_host)
+        self.tiles_grid.setContentsMargins(4, 4, 4, 4)
+        self.tiles_grid.setSpacing(8)
+        self.tiles_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        top = QHBoxLayout()
-        top.addWidget(self.host_combo, 1)
-        top.addWidget(self.connect_btn)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self.tiles_host)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.addWidget(header)
+        root.addWidget(scroll, 1)
+
+        self.refresh()
+
+    def refresh(self):
+        while self.tiles_grid.count():
+            item = self.tiles_grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        local_tile = _HostChoiceTile(
+            "Local (этот компьютер)", os.path.expanduser("~"), is_local=True
+        )
+        local_tile.mouseReleaseEvent = (
+            lambda ev, t=local_tile: self._on_choose("__local__", None)
+        )
+        self.tiles_grid.addWidget(local_tile, 0, 0)
+
+        names = self.store.names()
+        for i, name in enumerate(names, start=1):
+            info = self.store.get(name) or {}
+            user = info.get("user", "") or ""
+            host = info.get("host", "")
+            subtitle = f"{user}@{host}" if user else host
+            tile = _HostChoiceTile(name, subtitle, is_local=False)
+            tile.mouseReleaseEvent = (
+                lambda ev, n=name, inf=info: self._on_choose(n, inf)
+            )
+            row = i // 2
+            col = i % 2
+            self.tiles_grid.addWidget(tile, row, col)
+
+
+# ---------- Страница файлов ----------
+class _FileView(QWidget):
+    def __init__(self, panel, parent=None):
+        super().__init__(parent)
+        self.panel = panel
+        self.setStyleSheet("background-color: #101418;")
+
+        self.host_label = QLabel("—")
+        f = self.host_label.font()
+        f.setBold(True)
+        self.host_label.setFont(f)
+        self.host_label.setStyleSheet("color: #e5e9f0; padding: 2px 4px;")
+
+        self.change_btn = QPushButton("Сменить хост")
+        self.change_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2b3138; color: #d8dee9; border: none;
+                border-radius: 4px; padding: 4px 10px; font-size: 11px;
+            }
+            QPushButton:hover { background-color: #3a434e; }
+        """)
+        self.change_btn.clicked.connect(self._on_change)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(4, 4, 4, 0)
+        header.addWidget(self.host_label, 1)
+        header.addWidget(self.change_btn)
 
         self.path_label = QLabel("—")
         self.path_label.setStyleSheet("color: #7f8a99; padding: 2px 4px;")
@@ -209,6 +263,16 @@ class FilePanel(QWidget):
             QListWidget::item:selected { background: #2d6cdf; color: white; }
         """)
         self.listw.itemDoubleClicked.connect(self._on_double_click)
+
+        # --- drag & drop ---
+        self.listw.setDragEnabled(True)
+        self.listw.setAcceptDrops(True)
+        self.listw.setDropIndicatorShown(True)
+        self.listw.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.listw.viewport().setAcceptDrops(True)
+        self.listw.viewport().installEventFilter(self)
+        self.listw.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self._dragging_entries = []
 
         self.up_btn = QPushButton("..")
         self.up_btn.setFixedWidth(40)
@@ -229,75 +293,21 @@ class FilePanel(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
-        root.addLayout(top)
+        root.addLayout(header)
         root.addWidget(self.path_label)
         root.addWidget(self.listw, 1)
         root.addLayout(bottom)
 
-        self._enable_actions(False)
+    def _on_change(self):
+        self.panel._return_to_picker()
 
-    # --- подключение ---
-    def _on_connect_clicked(self):
-        key = self.host_combo.currentData()
-        if key == "__local__":
-            self._connect_local()
-        else:
-            info = self.store.get(key) or {}
-            self._connect_sftp(key, info)
-
-    def _connect_local(self):
-        if self.provider:
-            self.provider.close()
-        self.provider = LocalProvider()
-        self._enable_actions(True)
-        self.refresh()
-
-    def _connect_sftp(self, name, info):
-        host = info.get("host", "")
-        port = int(info.get("port", 22))
-        user = info.get("user", "")
-        key = info.get("key") or None
-
-        password = None
-        if not key:
-            password, ok = QInputDialog.getText(
-                self, "Пароль SFTP",
-                f"Пароль для {user}@{host}:",
-                QLineEdit.EchoMode.Password,
-            )
-            if not ok:
-                return
-
-        if self.provider:
-            self.provider.close()
-            self.provider = None
-
-        try:
-            self.provider = SFTPProvider(
-                host=host, port=port, user=user,
-                password=password, key=key,
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка SFTP", str(e))
-            self.provider = None
-            self._enable_actions(False)
-            return
-
-        self._enable_actions(True)
-        self.refresh()
-
-    def _enable_actions(self, on):
-        for w in (self.up_btn, self.refresh_btn, self.mkdir_btn, self.delete_btn):
-            w.setEnabled(on)
-        self.listw.setEnabled(on)
-
-    # --- работа со списком ---
     def refresh(self):
-        if not self.provider:
+        p = self.panel.provider
+        if not p:
             return
         self.listw.clear()
         try:
-            entries = self.provider.listdir()
+            entries = p.listdir()
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
             return
@@ -311,60 +321,201 @@ class FilePanel(QWidget):
                 item.setForeground(QColor("#88c0d0"))
             self.listw.addItem(item)
 
-        self.path_label.setText(self.provider.label())
-
-    def _selected_entries(self):
-        out = []
-        for item in self.listw.selectedItems():
-            e = item.data(Qt.ItemDataRole.UserRole)
-            if e:
-                out.append(e)
-        return out
+        self.path_label.setText(p.label())
+        self.host_label.setText(self.panel.host_name or "—")
 
     def _on_double_click(self, item):
         e = item.data(Qt.ItemDataRole.UserRole)
         if not e:
             return
         if e.is_dir:
-            self.provider.chdir(e.path)
-            self.refresh()
+            try:
+                self.panel.provider.chdir(e.path)
+                self.refresh()
+            except Exception as ex:
+                QMessageBox.critical(self, "Ошибка", str(ex))
 
     def _go_up(self):
-        if not self.provider:
+        if not self.panel.provider:
             return
-        self.provider.cd_up()
+        self.panel.provider.cd_up()
         self.refresh()
 
     def _mkdir(self):
-        if not self.provider:
+        if not self.panel.provider:
             return
         name, ok = QInputDialog.getText(self, "Новая папка", "Имя:")
         if not ok or not name.strip():
             return
         try:
-            self.provider.mkdir(name.strip())
+            self.panel.provider.mkdir(name.strip())
         except Exception as ex:
             QMessageBox.critical(self, "Ошибка", str(ex))
         self.refresh()
 
     def _delete(self):
-        entries = self._selected_entries()
+        entries = self.panel.selected_entries()
         if not entries:
             return
         if QMessageBox.question(
-            self, "Удалить",
-            f"Удалить {len(entries)} объект(ов)?"
+            self, "Удалить", f"Удалить {len(entries)} объект(ов)?"
         ) != QMessageBox.StandardButton.Yes:
             return
         for e in entries:
             try:
-                self.provider.remove(e)
+                self.panel.provider.remove(e)
             except Exception as ex:
                 QMessageBox.critical(self, "Ошибка удаления", f"{e.name}: {ex}")
         self.refresh()
 
+    # --- drag & drop ---
+    def eventFilter(self, obj, event):
+        if obj is self.listw.viewport():
+            et = event.type()
+            if et == QEvent.Type.MouseButtonPress:
+                pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                item = self.listw.itemAt(pos)
+                if item is not None:
+                    e = item.data(Qt.ItemDataRole.UserRole)
+                    self._dragging_entries = [e] if e else []
+                else:
+                    self._dragging_entries = []
+            elif et == QEvent.Type.MouseMove:
+                if event.buttons() & Qt.MouseButton.LeftButton and self._dragging_entries:
+                    self._start_drag()
+        return super().eventFilter(obj, event)
+
+    def _start_drag(self):
+        entries = self.panel.selected_entries() or self._dragging_entries
+        if not entries:
+            return
+        mime = QMimeData()
+        mime.setText("freemius-xfer")
+        mime.setData("application/x-freemius-src",
+                     str(id(self.panel)).encode())
+        drag = QDrag(self.listw)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat("application/x-freemius-src"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat("application/x-freemius-src"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasFormat("application/x-freemius-src"):
+            event.ignore()
+            return
+        try:
+            src_id = int(event.mimeData().data(
+                "application/x-freemius-src").data().decode())
+        except Exception:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.panel.request_drop_from.emit(src_id, self.panel)
+
+
+# ---------- Публичный виджет ----------
+class FilePanel(QWidget):
+    """Стек: выбор хоста плитками → файловый менеджер."""
+
+    request_drop_from = pyqtSignal(int, object)  # (src_panel_id, dst_panel)
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.provider = None
+        self.host_name = None
+
+        self.stack = QStackedWidget(self)
+        self.picker = _HostPicker(store, self._on_host_chosen)
+        self.fileview = _FileView(self)
+        self.stack.addWidget(self.picker)
+        self.stack.addWidget(self.fileview)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(self.stack)
+
+        self.stack.setCurrentIndex(0)
+
+    def _on_host_chosen(self, key, info):
+        if self.provider:
+            try:
+                self.provider.close()
+            except Exception:
+                pass
+            self.provider = None
+
+        if key == "__local__":
+            self.provider = LocalProvider()
+            self.host_name = "Local"
+        else:
+            info = info or {}
+            host = info.get("host", "")
+            port = int(info.get("port", 22))
+            user = info.get("user", "")
+            key_file = info.get("key") or None
+
+            password = _keyring_get(key) if not key_file else None
+            if not key_file and not password:
+                password, ok = QInputDialog.getText(
+                    self, "Пароль SFTP",
+                    f"Пароль для {user}@{host}:",
+                    QLineEdit.EchoMode.Password,
+                )
+                if not ok:
+                    return
+                password = password or None
+
+            try:
+                self.provider = SCPProvider(
+                    host=host, port=port, user=user,
+                    password=password, key=key_file,
+                )
+                self.host_name = key
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка SCP", str(e))
+                self.provider = None
+                return
+
+        self.fileview.refresh()
+        self.stack.setCurrentIndex(1)
+
+    def _return_to_picker(self):
+        if self.provider:
+            try:
+                self.provider.close()
+            except Exception:
+                pass
+            self.provider = None
+        self.host_name = None
+        self.picker.refresh()
+        self.stack.setCurrentIndex(0)
+
+    def refresh(self):
+        if self.stack.currentIndex() == 1:
+            self.fileview.refresh()
+        else:
+            self.picker.refresh()
+
+    def selected_entries(self):
+        return [
+            it.data(Qt.ItemDataRole.UserRole)
+            for it in self.fileview.listw.selectedItems()
+            if it.data(Qt.ItemDataRole.UserRole)
+        ]
+
     def selected_entry(self):
-        items = self.listw.selectedItems()
+        items = self.fileview.listw.selectedItems()
         if not items:
             return None
         return items[0].data(Qt.ItemDataRole.UserRole)
@@ -373,20 +524,37 @@ class FilePanel(QWidget):
         return self.provider.cwd if self.provider else ""
 
 
-def transfer_file(src_panel: FilePanel, dst_panel: FilePanel, entry: FileEntry):
-    """Скопировать entry из src_panel в cwd dst_panel."""
+# ---------- Передача файлов ----------
+def transfer_file(src_panel, dst_panel, entry):
+    """Скопировать entry из src_panel в cwd dst_panel. Через /tmp."""
+    import shutil
+    import tempfile
+
     if not src_panel.provider or not dst_panel.provider:
         return False
-    dst_path = dst_panel.provider.cwd.rstrip("/") + "/" + entry.name
+
+    dst_dir = getattr(dst_panel.provider, "cwd", None)
+    if dst_dir is None:
+        return False
+    dst_path = dst_dir.rstrip("/") + "/" + entry.name
+
+    tmpdir = tempfile.mkdtemp(prefix="freemius_xfer_")
+    local_tmp = os.path.join(tmpdir, entry.name)
     try:
-        with src_panel.provider.open_read(entry.path) as fin, \
-             dst_panel.provider.open_write(dst_path) as fout:
-            while True:
-                chunk = fin.read(65536)
-                if not chunk:
-                    break
-                fout.write(chunk)
+        src = src_panel.provider
+        if src.kind == "local":
+            shutil.copy2(entry.path, local_tmp)
+        else:
+            src.get_file(entry.path, local_tmp)
+
+        dst = dst_panel.provider
+        if dst.kind == "local":
+            shutil.copy2(local_tmp, dst_path)
+        else:
+            dst.put_file(local_tmp, dst_path)
     except Exception as e:
         QMessageBox.critical(src_panel, "Ошибка передачи", str(e))
         return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     return True

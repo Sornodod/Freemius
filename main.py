@@ -536,6 +536,8 @@ class SftpTab(QWidget):
 
         self.left = FilePanel(store)
         self.right = FilePanel(store)
+        self.left.request_drop_from.connect(self._on_drop)
+        self.right.request_drop_from.connect(self._on_drop)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.left)
@@ -559,8 +561,16 @@ class SftpTab(QWidget):
         root.addWidget(splitter, 1)
         root.addLayout(center)
 
-        self.left.host_combo.setCurrentIndex(0)
-        self.left._connect_local()
+    def _on_drop(self, src_id, dst_panel):
+        src_panel = self.left if id(self.left) == src_id else self.right
+        if src_panel is dst_panel:
+            return
+        entries = src_panel.selected_entries()
+        if not entries:
+            return
+        for entry in entries:
+            transfer_file(src_panel, dst_panel, entry)
+        dst_panel.refresh()
 
     def _transfer_to_left(self):
         src, dst = self.right, self.left
@@ -754,7 +764,6 @@ class HomeTab(QWidget):
 
 # ---------- Выбор ключа ----------
 def _list_ssh_keys():
-    """Файлы в ~/.ssh, которые похожи на приватные ключи."""
     ssh_dir = Path.home() / ".ssh"
     if not ssh_dir.is_dir():
         return []
@@ -774,8 +783,6 @@ def _list_ssh_keys():
 
 
 class KeyPickerButton(QToolButton):
-    """Кнопка «…» — меню с ключами из ~/.ssh + «Другой файл…»."""
-
     key_selected = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -853,7 +860,6 @@ class Drawer(QWidget):
         self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.pass_edit.setPlaceholderText("Пароль SSH")
 
-        # ключ: QLineEdit + кнопка "…"
         self.key_edit = QLineEdit()
         self.key_edit.setPlaceholderText("~/.ssh/id_ed25519 (опционально)")
         self.key_btn = KeyPickerButton()
@@ -938,7 +944,6 @@ class Drawer(QWidget):
         self.host_edit.setText(host)
         self.port_spin.setValue(port)
         self.user_edit.setText(user)
-        # пароль показываем как есть (не точками) — по запросу
         self.pass_edit.setEchoMode(QLineEdit.EchoMode.Normal)
         self.pass_edit.setText(password or "")
         self.key_edit.setText(key or "")
@@ -1005,7 +1010,7 @@ class MainWindow(QMainWindow):
 
         self.store = ConnectionStore()
         self._tab_activity = {}
-        self._editing_name = None  # имя редактируемого хоста (для Drawer)
+        self._editing_name = None
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
@@ -1092,7 +1097,6 @@ class MainWindow(QMainWindow):
         old_name = self._editing_name
         self._editing_name = None
 
-        # если при редактировании переименовали — удалим старое
         if old_name and old_name != name:
             self.store.remove(old_name)
 
@@ -1104,7 +1108,6 @@ class MainWindow(QMainWindow):
                 user=data["user"],
                 key=data["key"] or "",
             )
-            # пароль в keyring
             if data["password"]:
                 keyring_set(name, data["password"])
             else:
@@ -1132,7 +1135,6 @@ class MainWindow(QMainWindow):
             "password": None,
             "key": info.get("key") or None,
         }
-        # если нет ключа — тянем пароль из keyring
         if not params["key"]:
             password = keyring_get(name)
             if not password:
@@ -1144,8 +1146,6 @@ class MainWindow(QMainWindow):
                 if not ok:
                     return
                 password = password or None
-                # если пользователь ввёл пароль — предложим запомнить?
-                # (просто сохраняем в keyring на будущее)
                 if password:
                     keyring_set(name, password)
             params["password"] = password
@@ -1252,7 +1252,7 @@ class MainWindow(QMainWindow):
             self, "Удалить", f"Удалить «{name}» из сохранённых?"
         ) != QMessageBox.StandardButton.Yes:
             return
-        self.store.remove(name)   # внутри вызывает keyring_delete
+        self.store.remove(name)
         self.home.refresh()
 
     def closeEvent(self, event):
