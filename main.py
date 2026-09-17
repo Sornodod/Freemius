@@ -4,16 +4,19 @@ import sys
 from pathlib import Path
 
 import pyte
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect
+from PyQt6.QtCore import (
+    Qt, QTimer, pyqtSignal, QObject, QRect, QPropertyAnimation,
+    QEasingCurve, QPoint, QSize,
+)
 from PyQt6.QtGui import (
     QFont, QFontDatabase, QKeyEvent, QPainter, QColor, QAction,
     QShortcut, QKeySequence, QIcon, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QSpinBox, QPushButton, QLabel, QComboBox,
-    QFormLayout, QGroupBox, QMessageBox, QInputDialog, QTabWidget,
-    QMenu,
+    QGridLayout, QLineEdit, QSpinBox, QPushButton, QLabel,
+    QFormLayout, QMessageBox, QTabWidget,
+    QMenu, QScrollArea, QFrame, QCheckBox, QSizePolicy,
 )
 
 from ssh_client import SSHClient
@@ -144,7 +147,7 @@ class TerminalWidget(QWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
 
-        self._sel_start = None  # (row, col)
+        self._sel_start = None
         self._sel_end = None
 
         self._cursor_visible = True
@@ -162,7 +165,6 @@ class TerminalWidget(QWidget):
         self._cursor_visible = not self._cursor_visible
         self.update()
 
-    # --- размеры ---
     def _cell_size(self):
         fm = self.fontMetrics()
         return fm.horizontalAdvance("M"), fm.height()
@@ -188,7 +190,6 @@ class TerminalWidget(QWidget):
         self.stream.feed(data)
         self.update()
 
-    # --- палитра ---
     def _map_color(self, name, bold):
         mapping = {
             "black": 0, "red": 1, "green": 2, "brown": 3, "yellow": 3,
@@ -209,7 +210,6 @@ class TerminalWidget(QWidget):
                 pass
         return DEFAULT_FG
 
-    # --- отрисовка ---
     def paintEvent(self, event):
         painter = QPainter(self)
         cw, ch = self._cell_size()
@@ -238,10 +238,8 @@ class TerminalWidget(QWidget):
                 ch_ = char.data or " "
                 if ch_ == " " and char.bg == "default" and char.fg == "default":
                     continue
-
                 fg = DEFAULT_FG if char.fg == "default" else self._map_color(char.fg, char.bold)
                 bg = DEFAULT_BG if char.bg == "default" else self._map_color(char.bg, False)
-
                 x_px, y_px = x * cw, y * ch
                 if bg != DEFAULT_BG:
                     painter.fillRect(QRect(x_px, y_px, cw, ch), bg)
@@ -257,7 +255,6 @@ class TerminalWidget(QWidget):
             painter.drawRect(QRect(cx * cw, cy * ch, cw, ch))
         painter.end()
 
-    # --- выделение ---
     def _selection_rect(self):
         if self._sel_start is None or self._sel_end is None:
             return None
@@ -309,21 +306,15 @@ class TerminalWidget(QWidget):
             out.append("".join(chars).rstrip())
         return "\n".join(out)
 
-    # --- контекстное меню ---
     def _show_context_menu(self, pos):
         menu = QMenu(self)
         act_copy = QAction("Копировать", self)
-        act_copy.setShortcut(QKeySequence("Ctrl+Shift+C"))
         act_copy.setEnabled(bool(self.selected_text()))
         act_copy.triggered.connect(self._copy_selection)
-
         act_paste = QAction("Вставить", self)
-        act_paste.setShortcut(QKeySequence("Ctrl+Shift+V"))
         act_paste.triggered.connect(self._paste_from_clipboard)
-
         act_all = QAction("Выделить всё", self)
         act_all.triggered.connect(self._select_all)
-
         menu.addAction(act_copy)
         menu.addAction(act_paste)
         menu.addSeparator()
@@ -345,7 +336,6 @@ class TerminalWidget(QWidget):
         self._sel_end = (self.screen.lines - 1, self.screen.columns - 1)
         self.update()
 
-    # --- ввод ---
     def keyPressEvent(self, event: QKeyEvent):
         key = event.key()
         text = event.text()
@@ -397,7 +387,6 @@ class TerminalWidget(QWidget):
 
 # ---------- Вкладка = одна SSH-сессия ----------
 class TerminalTab(QWidget):
-    title_changed = pyqtSignal(str)
     closed = pyqtSignal(object)
     status_changed = pyqtSignal(object, str)
     activity = pyqtSignal(object)
@@ -423,9 +412,6 @@ class TerminalTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.terminal, stretch=1)
         layout.addWidget(self.status_label)
-
-        title = f"{params['user']}@{params['host']}" if params.get("user") else params["host"]
-        self.title = title
 
     def start(self):
         self._set_state("connecting")
@@ -489,22 +475,202 @@ class TerminalTab(QWidget):
         self._set_state("disconnected")
 
 
-# ---------- Главное окно ----------
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Freemius SSH Client")
-        self.resize(1000, 700)
+# ---------- Плитка хоста ----------
+class HostTile(QFrame):
+    clicked = pyqtSignal(str)
+    edit_requested = pyqtSignal(str)
+    delete_requested = pyqtSignal(str)
 
-        self.store = ConnectionStore()
-        self._tab_activity = {}
+    def __init__(self, name, info, parent=None):
+        super().__init__(parent)
+        self.name = name
+        self.info = info
+        self.setObjectName("HostTile")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(72)
+        self.setMinimumWidth(220)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet("""
+            #HostTile {
+                background-color: #1b2026;
+                border: 1px solid #2b3138;
+                border-radius: 8px;
+            }
+            #HostTile:hover {
+                background-color: #232a32;
+                border: 1px solid #3f4a55;
+            }
+        """)
 
-        # --- панель подключения ---
-        self.saved_combo = QComboBox()
-        self.saved_combo.setMinimumWidth(220)
-        self.saved_combo.currentTextChanged.connect(self._on_saved_selected)
+        user = info.get("user", "") or ""
+        host = info.get("host", "")
+        subtitle = f"{user}@{host}" if user else host
 
-        self.host_edit = QLineEdit("127.0.0.1")
+        self.title_label = QLabel(name)
+        f = self.title_label.font()
+        f.setPointSize(11)
+        f.setBold(True)
+        self.title_label.setFont(f)
+        self.title_label.setStyleSheet("color: #e5e9f0; background: transparent;")
+
+        self.sub_label = QLabel(subtitle)
+        self.sub_label.setStyleSheet("color: #7f8a99; background: transparent;")
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+        text_col.addWidget(self.title_label)
+        text_col.addWidget(self.sub_label)
+
+        dot = QLabel()
+        dot.setPixmap(make_status_icon("disconnected").pixmap(12, 12))
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14, 12, 14, 12)
+        row.addWidget(dot, 0, Qt.AlignmentFlag.AlignTop)
+        row.addLayout(text_col, 1)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.name)
+        elif event.button() == Qt.MouseButton.RightButton:
+            self._context_menu(event.globalPosition().toPoint())
+
+    def _context_menu(self, global_pos):
+        menu = QMenu(self)
+        act_open = QAction("Открыть", self)
+        act_open.triggered.connect(lambda: self.clicked.emit(self.name))
+        act_edit = QAction("Редактировать", self)
+        act_edit.triggered.connect(lambda: self.edit_requested.emit(self.name))
+        act_del = QAction("Удалить", self)
+        act_del.triggered.connect(lambda: self.delete_requested.emit(self.name))
+        menu.addAction(act_open)
+        menu.addAction(act_edit)
+        menu.addSeparator()
+        menu.addAction(act_del)
+        menu.exec(global_pos)
+
+
+# ---------- Домашняя вкладка (плитки) ----------
+class HomeTab(QWidget):
+    """Отдельная вкладка с плитками сохранённых хостов."""
+
+    host_activated = pyqtSignal(str)
+    host_edit = pyqtSignal(str)
+    host_delete = pyqtSignal(str)
+    new_host_clicked = pyqtSignal()
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.setStyleSheet("background-color: #101418;")
+
+        # Кнопка "Новый хост" сверху
+        new_btn = QPushButton("+ Новый хост")
+        new_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2d6cdf; color: white; border: none;
+                border-radius: 6px; padding: 8px 16px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #3a7ce8; }
+            QPushButton:pressed { background-color: #245bbd; }
+        """)
+        new_btn.clicked.connect(self.new_host_clicked.emit)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(24, 20, 24, 0)
+        top.addWidget(new_btn)
+        top.addStretch(1)
+
+        # Скроллируемая область с плитками
+        self.tiles_host = QWidget()
+        self.tiles_grid = QGridLayout(self.tiles_host)
+        self.tiles_grid.setContentsMargins(24, 20, 24, 24)
+        self.tiles_grid.setSpacing(14)
+        self.tiles_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self.tiles_host)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addLayout(top)
+        root.addWidget(scroll, 1)
+
+    def refresh(self):
+        while self.tiles_grid.count():
+            item = self.tiles_grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        names = self.store.names()
+        if not names:
+            empty = QLabel("Нет сохранённых хостов.\nНажмите «+ Новый хост» сверху.")
+            empty.setStyleSheet("color: #6b7784; padding: 40px; font-size: 13px;")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.tiles_grid.addWidget(empty, 0, 0)
+            return
+
+        # Автоматическое количество колонок по ширине
+        cols = self._column_count()
+        for i, name in enumerate(names):
+            info = self.store.get(name)
+            tile = HostTile(name, info)
+            tile.clicked.connect(self.host_activated.emit)
+            tile.edit_requested.connect(self.host_edit.emit)
+            tile.delete_requested.connect(self.host_delete.emit)
+            self.tiles_grid.addWidget(tile, i // cols, i % cols)
+
+        # растянуть колонки равномерно
+        for c in range(cols):
+            self.tiles_grid.setColumnStretch(c, 1)
+
+    def _column_count(self):
+        # ширину окна делим на ~260px на плитку
+        w = self.width() or 1200
+        return max(1, (w - 48) // 260)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Перестраиваем сетку при заметном изменении ширины
+        new_cols = self._column_count()
+        if getattr(self, "_last_cols", None) != new_cols:
+            self._last_cols = new_cols
+            self.refresh()
+
+
+# ---------- Drawer ----------
+class Drawer(QWidget):
+    submitted = pyqtSignal(dict)
+    cancelled = pyqtSignal()
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("background-color: rgba(0,0,0,140);")
+        self.hide()
+
+        width = 400
+
+        self.panel = QFrame(self)
+        self.panel.setObjectName("DrawerPanel")
+        self.panel.setStyleSheet("""
+            #DrawerPanel {
+                background-color: #1b2026;
+                border-left: 1px solid #2b3138;
+            }
+        """)
+        self.panel.setFixedWidth(width)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Например: Домашний сервер")
+        self.host_edit = QLineEdit()
+        self.host_edit.setPlaceholderText("192.168.1.10 или example.com")
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(22)
@@ -512,71 +678,206 @@ class MainWindow(QMainWindow):
         self.pass_edit = QLineEdit()
         self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.key_edit = QLineEdit()
-        self.key_edit.setPlaceholderText("Путь к приватному ключу (опционально)")
+        self.key_edit.setPlaceholderText("~/.ssh/id_ed25519 (опционально)")
 
-        self.save_btn = QPushButton("Сохранить")
-        self.delete_btn = QPushButton("Удалить")
-        self.new_tab_btn = QPushButton("Новая сессия")
-        self.disconnect_btn = QPushButton("Отключиться")
-
-        self.save_btn.clicked.connect(self.save_connection)
-        self.delete_btn.clicked.connect(self.delete_connection)
-        self.new_tab_btn.clicked.connect(self.open_new_session)
-        self.disconnect_btn.clicked.connect(self.close_current_tab)
+        self.save_check = QCheckBox("Сохранить в список")
+        self.save_check.setChecked(True)
 
         form = QFormLayout()
-        form.addRow("Сохранённые:", self.saved_combo)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.addRow("Имя:", self.name_edit)
         form.addRow("Хост:", self.host_edit)
         form.addRow("Порт:", self.port_spin)
         form.addRow("Пользователь:", self.user_edit)
         form.addRow("Пароль:", self.pass_edit)
         form.addRow("Ключ:", self.key_edit)
 
-        btn_row = QHBoxLayout()
-        btn_row.addWidget(self.save_btn)
-        btn_row.addWidget(self.delete_btn)
-        btn_row.addStretch(1)
-        btn_row.addWidget(self.new_tab_btn)
-        btn_row.addWidget(self.disconnect_btn)
+        title = QLabel("Новое подключение")
+        f = title.font()
+        f.setPointSize(14)
+        f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet("color: #e5e9f0;")
 
-        form_box = QGroupBox("Подключение SSH")
-        v = QVBoxLayout()
-        v.addLayout(form)
-        v.addLayout(btn_row)
-        form_box.setLayout(v)
+        hint = QLabel("Пароль не сохраняется на диск.")
+        hint.setStyleSheet("color: #7f8a99; font-size: 11px;")
 
-        self.status_label = QLabel("Готово")
+        btn_ok = QPushButton("Подключиться")
+        btn_ok.setStyleSheet("""
+            QPushButton {
+                background-color: #2d6cdf; color: white; border: none;
+                border-radius: 6px; padding: 8px 12px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #3a7ce8; }
+        """)
+        btn_cancel = QPushButton("Отмена")
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #2b3138; color: #d8dee9; border: none;
+                border-radius: 6px; padding: 8px 12px;
+            }
+            QPushButton:hover { background-color: #3a434e; }
+        """)
+        btn_ok.clicked.connect(self._on_submit)
+        btn_cancel.clicked.connect(self._on_cancel)
 
-        # --- вкладки ---
+        btns = QHBoxLayout()
+        btns.addWidget(btn_cancel)
+        btns.addStretch(1)
+        btns.addWidget(btn_ok)
+
+        pv = QVBoxLayout(self.panel)
+        pv.setContentsMargins(20, 20, 20, 20)
+        pv.setSpacing(12)
+        pv.addWidget(title)
+        pv.addLayout(form)
+        pv.addWidget(hint)
+        pv.addWidget(self.save_check)
+        pv.addStretch(1)
+        pv.addLayout(btns)
+
+        self._width = width
+        self._anim = QPropertyAnimation(self.panel, b"pos", self)
+        self._anim.setDuration(180)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.panel.resize(self._width, self.height())
+        if self.isVisible() and not self._anim.state():
+            self.panel.move(self.width() - self._width, 0)
+
+    def open_with(self, name="", host="", port=22, user="", key="", save=True):
+        self.name_edit.setText(name)
+        self.host_edit.setText(host)
+        self.port_spin.setValue(port)
+        self.user_edit.setText(user)
+        self.pass_edit.clear()
+        self.key_edit.setText(key or "")
+        self.save_check.setChecked(save)
+        self.show()
+        self.raise_()
+        self.panel.resize(self._width, self.height())
+        self.panel.move(self.width(), 0)
+        self._anim.stop()
+        self._anim.setStartValue(QPoint(self.width(), 0))
+        self._anim.setEndValue(QPoint(self.width() - self._width, 0))
+        self._anim.start()
+        self.host_edit.setFocus()
+
+    def close_drawer(self):
+        self._anim.stop()
+        self._anim.setStartValue(self.panel.pos())
+        self._anim.setEndValue(QPoint(self.width(), 0))
+        self._anim.finished.connect(self._after_close)
+        self._anim.start()
+
+    def _after_close(self):
+        try:
+            self._anim.finished.disconnect(self._after_close)
+        except Exception:
+            pass
+        self.hide()
+
+    def mousePressEvent(self, event):
+        if not self.panel.geometry().contains(event.position().toPoint()):
+            self._on_cancel()
+
+    def _on_submit(self):
+        name = self.name_edit.text().strip()
+        host = self.host_edit.text().strip()
+        if not host:
+            QMessageBox.warning(self, "Ошибка", "Укажите хост")
+            return
+        if not name:
+            user = self.user_edit.text().strip()
+            name = f"{user}@{host}" if user else host
+        self.submitted.emit({
+            "name": name,
+            "host": host,
+            "port": self.port_spin.value(),
+            "user": self.user_edit.text().strip(),
+            "password": self.pass_edit.text() or None,
+            "key": self.key_edit.text().strip() or None,
+            "save": self.save_check.isChecked(),
+        })
+
+    def _on_cancel(self):
+        self.cancelled.emit()
+        self.close_drawer()
+
+
+# ---------- Главное окно ----------
+class MainWindow(QMainWindow):
+    HOME_TAB_TITLE = "Главная"
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Freemius SSH Client")
+        self.resize(1200, 760)
+
+        self.store = ConnectionStore()
+        self._tab_activity = {}
+
+        # Табы
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._on_tab_close_requested)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: 0; background: #101418; }
+            QTabBar::tab {
+                background: #1b2026; color: #a6adba;
+                padding: 6px 12px; margin-right: 2px;
+                border-top-left-radius: 4px; border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected { background: #101418; color: #e5e9f0; }
+        """)
 
-        root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.addWidget(form_box)
-        layout.addWidget(self.tabs, stretch=1)
-        layout.addWidget(self.status_label)
-        self.setCentralWidget(root)
+        # Домашняя вкладка
+        self.home = HomeTab(self.store)
+        self.home.host_activated.connect(self.open_saved_host)
+        self.home.host_edit.connect(self.edit_saved_host)
+        self.home.host_delete.connect(self.delete_saved_host)
+        self.home.new_host_clicked.connect(self.open_new_host_drawer)
 
-        self._refresh_saved_list()
-        self._update_disconnect_enabled()
+        self.home_index = self.tabs.addTab(self.home, self.HOME_TAB_TITLE)
+        # убрать крестик с домашней вкладки
+        self.tabs.tabBar().setTabButton(self.home_index, self.tabs.tabBar().ButtonPosition.RightSide, None)
+        self.tabs.tabBar().setTabButton(self.home_index, self.tabs.tabBar().ButtonPosition.LeftSide, None)
+
+        self.setCentralWidget(self.tabs)
+
+        # Drawer
+        self.drawer = Drawer(self)
+        self.drawer.submitted.connect(self._on_drawer_submit)
+
+        self.home.refresh()
         self._install_shortcuts()
 
-    # ---------- горячие клавиши ----------
+    # --- геометрия drawer ---
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.drawer.setGeometry(self.rect())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.drawer.setGeometry(self.rect())
+
+    # --- шорткаты ---
     def _install_shortcuts(self):
-        QShortcut(QKeySequence("Ctrl+T"), self, activated=self.open_new_session)
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=self.open_new_host_drawer)
         QShortcut(QKeySequence("Ctrl+W"), self, activated=self.close_current_tab)
-        QShortcut(QKeySequence("Ctrl+Tab"), self,
-                  activated=lambda: self._cycle_tab(1))
-        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self,
-                  activated=lambda: self._cycle_tab(-1))
-        QShortcut(QKeySequence("Ctrl+PgDown"), self,
-                  activated=lambda: self._cycle_tab(1))
-        QShortcut(QKeySequence("Ctrl+PgUp"), self,
-                  activated=lambda: self._cycle_tab(-1))
+        QShortcut(QKeySequence("Ctrl+Tab"), self, activated=lambda: self._cycle_tab(1))
+        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self, activated=lambda: self._cycle_tab(-1))
+        QShortcut(QKeySequence("Ctrl+PgDown"), self, activated=lambda: self._cycle_tab(1))
+        QShortcut(QKeySequence("Ctrl+PgUp"), self, activated=lambda: self._cycle_tab(-1))
+        QShortcut(QKeySequence("Escape"), self, activated=self._close_drawer_if_open)
+
+    def _close_drawer_if_open(self):
+        if self.drawer.isVisible():
+            self.drawer.close_drawer()
 
     def _cycle_tab(self, delta):
         n = self.tabs.count()
@@ -585,98 +886,79 @@ class MainWindow(QMainWindow):
         idx = (self.tabs.currentIndex() + delta) % n
         self.tabs.setCurrentIndex(idx)
 
-    # ---------- сохранённые подключения ----------
-    def _refresh_saved_list(self, keep=None):
-        self.saved_combo.blockSignals(True)
-        self.saved_combo.clear()
-        self.saved_combo.addItem("")
-        for name in self.store.names():
-            self.saved_combo.addItem(name)
-        if keep:
-            idx = self.saved_combo.findText(keep)
-            if idx >= 0:
-                self.saved_combo.setCurrentIndex(idx)
-        self.saved_combo.blockSignals(False)
+    # --- drawer ---
+    def open_new_host_drawer(self):
+        self.drawer.open_with(save=True)
 
-    def _on_saved_selected(self, name):
-        if not name:
-            return
-        item = self.store.get(name)
-        if not item:
-            return
-        self.host_edit.setText(item.get("host", ""))
-        self.port_spin.setValue(int(item.get("port", 22)))
-        self.user_edit.setText(item.get("user", ""))
-        self.key_edit.setText(item.get("key", "") or "")
-        self.pass_edit.clear()
-        self.status_label.setText(f"Загружено: {name}")
-
-    def save_connection(self):
-        host = self.host_edit.text().strip()
-        user = self.user_edit.text().strip()
-        if not host:
-            QMessageBox.warning(self, "Ошибка", "Укажите хост перед сохранением")
-            return
-        default_name = f"{user}@{host}" if user else host
-        name, ok = QInputDialog.getText(
-            self, "Сохранить подключение", "Имя подключения:", text=default_name
+    def edit_saved_host(self, name):
+        info = self.store.get(name) or {}
+        self.drawer.open_with(
+            name=name,
+            host=info.get("host", ""),
+            port=int(info.get("port", 22)),
+            user=info.get("user", ""),
+            key=info.get("key", ""),
+            save=True,
         )
-        if not ok or not name.strip():
-            return
-        name = name.strip()
-        self.store.add(
-            name=name, host=host, port=self.port_spin.value(),
-            user=user, key=self.key_edit.text().strip(),
-        )
-        self._refresh_saved_list(keep=name)
-        self.status_label.setText(f"Сохранено: {name}")
 
-    def delete_connection(self):
-        name = self.saved_combo.currentText()
-        if not name:
-            QMessageBox.information(self, "Удаление", "Выберите подключение из списка")
-            return
-        if QMessageBox.question(
-            self, "Удалить подключение", f"Удалить «{name}»?"
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        self.store.remove(name)
-        self._refresh_saved_list()
-        self.status_label.setText(f"Удалено: {name}")
-
-    # ---------- вкладки ----------
-    def open_new_session(self):
-        host = self.host_edit.text().strip()
-        if not host:
-            QMessageBox.warning(self, "Ошибка", "Укажите хост")
-            return
+    def _on_drawer_submit(self, data):
+        name = data["name"]
+        if data["save"]:
+            self.store.add(
+                name=name,
+                host=data["host"],
+                port=data["port"],
+                user=data["user"],
+                key=data["key"] or "",
+            )
+            self.home.refresh()
 
         params = {
-            "host": host,
-            "port": self.port_spin.value(),
-            "user": self.user_edit.text().strip(),
-            "password": self.pass_edit.text() or None,
-            "key": self.key_edit.text().strip() or None,
+            "host": data["host"],
+            "port": data["port"],
+            "user": data["user"],
+            "password": data["password"],
+            "key": data["key"],
         }
+        self._open_session(name, params)
+        self.drawer.close_drawer()
 
+    # --- открытие сессии ---
+    def open_saved_host(self, name):
+        info = self.store.get(name)
+        if not info:
+            return
+        params = {
+            "host": info.get("host", ""),
+            "port": int(info.get("port", 22)),
+            "user": info.get("user", ""),
+            "password": None,
+            "key": info.get("key") or None,
+        }
+        self._open_session(name, params)
+
+    def _open_session(self, display_name, params):
         tab = TerminalTab(params)
         tab.closed.connect(self._on_tab_closed)
         tab.status_changed.connect(self._on_tab_status)
         tab.activity.connect(self._on_tab_activity)
 
-        idx = self.tabs.addTab(tab, tab.title)
+        idx = self.tabs.addTab(tab, display_name)
         self.tabs.setTabIcon(idx, make_status_icon("connecting"))
         self._tab_activity[id(tab)] = False
         self.tabs.setCurrentIndex(idx)
         tab.start()
 
+    # --- управление табами ---
     def close_current_tab(self):
         idx = self.tabs.currentIndex()
-        if idx < 0:
-            return
+        if idx <= self.home_index:
+            return  # домашнюю не закрываем
         self._on_tab_close_requested(idx)
 
     def _on_tab_close_requested(self, idx):
+        if idx == self.home_index:
+            return
         tab = self.tabs.widget(idx)
         if tab is None:
             return
@@ -693,7 +975,8 @@ class MainWindow(QMainWindow):
         self._tab_activity.pop(id(tab), None)
         self.tabs.removeTab(idx)
         tab.deleteLater()
-        self._update_disconnect_enabled()
+        # индекс домашней вкладки мог сдвинуться — обновим
+        self.home_index = self.tabs.indexOf(self.home)
 
     def _on_tab_closed(self, tab):
         idx = self.tabs.indexOf(tab)
@@ -701,7 +984,7 @@ class MainWindow(QMainWindow):
             self.tabs.removeTab(idx)
             tab.deleteLater()
         self._tab_activity.pop(id(tab), None)
-        self._update_disconnect_enabled()
+        self.home_index = self.tabs.indexOf(self.home)
 
     def _on_tab_status(self, tab, state):
         idx = self.tabs.indexOf(tab)
@@ -719,7 +1002,8 @@ class MainWindow(QMainWindow):
         idx = self.tabs.indexOf(tab)
         if idx < 0:
             return
-        base = tab.title
+        base = getattr(tab, "_base_title", None) or self.tabs.tabText(idx).lstrip("● ").strip()
+        tab._base_title = base
         bar = self.tabs.tabBar()
         if self._tab_activity.get(id(tab)):
             self.tabs.setTabText(idx, "● " + base)
@@ -734,10 +1018,15 @@ class MainWindow(QMainWindow):
             self._tab_activity[id(tab)] = False
             self._update_tab_title(tab)
             tab.terminal.setFocus()
-        self._update_disconnect_enabled()
 
-    def _update_disconnect_enabled(self):
-        self.disconnect_btn.setEnabled(self.tabs.count() > 0)
+    # --- удаление плитки ---
+    def delete_saved_host(self, name):
+        if QMessageBox.question(
+            self, "Удалить", f"Удалить «{name}» из сохранённых?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.store.remove(name)
+        self.home.refresh()
 
     def closeEvent(self, event):
         for i in range(self.tabs.count()):
