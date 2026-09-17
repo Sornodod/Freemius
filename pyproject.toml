@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freemius"
+version = "0.2.0"
+description = "GUI SSH/SFTP client for Linux"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Sornodod", email = "sornodod@users.noreply.github.com" }]
+dependencies = [
+    "PyQt6>=6.6.0",
+    "paramiko>=3.4.0",
+    "pyte>=0.8.1",
+    "keyring>=25.0.0",
+]
+
+[project.scripts]
+freemius = "freemius.app:main"
+
+[project.urls]
+Homepage = "https://github.com/Sornodod/Freemius"
+Repository = "https://github.com/Sornodod/Freemius"
+
+[tool.setuptools]
+packages = ["freemius", "freemius.sftp"]

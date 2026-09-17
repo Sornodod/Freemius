@@ -4,3 +4,10 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# build artifacts
+build/
+dist/
+*.AppImage
+*.AppDir/
+*.spec
