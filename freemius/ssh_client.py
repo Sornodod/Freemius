@@ -1,16 +1,9 @@
 import logging
-import sys
 import threading
 
 import paramiko
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] ssh: %(message)s",
-    stream=sys.stdout,
-)
 log = logging.getLogger("ssh")
-logging.getLogger("paramiko").setLevel(logging.INFO)
 
 
 class SSHClient:
@@ -33,18 +26,7 @@ class SSHClient:
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        # Логика аутентификации:
-        #   - есть ключ  → только ключ (+ пароль, если это passphrase)
-        #   - есть пароль→ только пароль
-        #   - ничего     → ищем ключи в ~/.ssh, но БЕЗ ssh-agent
-        # Если позволить paramiko перебирать все ключи + агент,
-        # sshd часто рвёт соединение с "Too many authentication failures".
-        kwargs = dict(
-            hostname=host,
-            port=port,
-            username=username,
-            timeout=10,
-        )
+        kwargs = dict(hostname=host, port=port, username=username, timeout=10)
         if key_filename:
             kwargs["key_filename"] = key_filename
             kwargs["password"] = password or None
@@ -56,7 +38,7 @@ class SSHClient:
             kwargs["allow_agent"] = False
         else:
             kwargs["look_for_keys"] = True
-            kwargs["allow_agent"] = False  # без агента!
+            kwargs["allow_agent"] = False
 
         try:
             self.client.connect(**kwargs)

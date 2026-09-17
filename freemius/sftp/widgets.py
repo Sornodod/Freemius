@@ -1,8 +1,6 @@
-"""Панель файлового менеджера: сначала выбор хоста плитками, потом файлы."""
+"""Плитка выбора хоста, страница выбора, страница файлов."""
 
 import os
-import stat as stat_module
-import time
 
 from PyQt6.QtCore import Qt, QEvent, QMimeData, pyqtSignal
 from PyQt6.QtGui import QColor, QDrag
@@ -13,18 +11,16 @@ from PyQt6.QtWidgets import (
     QFrame, QScrollArea, QSizePolicy,
 )
 
-from scp_provider import SCPProvider
 
+class FileEntry:
+    __slots__ = ("name", "is_dir", "size", "mtime", "path")
 
-KEYRING_SERVICE = "freemius"
-
-
-def _keyring_get(name):
-    try:
-        import keyring
-        return keyring.get_password(KEYRING_SERVICE, name)
-    except Exception:
-        return None
+    def __init__(self, name, is_dir, size, mtime, path):
+        self.name = name
+        self.is_dir = is_dir
+        self.size = size
+        self.mtime = mtime
+        self.path = path
 
 
 def _human_size(n):
@@ -40,75 +36,13 @@ def _human_size(n):
 
 
 def _fmt_time(ts):
+    import time
     try:
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
     except Exception:
         return ""
 
 
-class FileEntry:
-    __slots__ = ("name", "is_dir", "size", "mtime", "path")
-
-    def __init__(self, name, is_dir, size, mtime, path):
-        self.name = name
-        self.is_dir = is_dir
-        self.size = size
-        self.mtime = mtime
-        self.path = path
-
-
-# ---------- Локальный провайдер ----------
-class LocalProvider:
-    kind = "local"
-
-    def __init__(self):
-        self.cwd = os.path.expanduser("~")
-
-    def listdir(self):
-        entries = []
-        try:
-            for name in os.listdir(self.cwd):
-                full = os.path.join(self.cwd, name)
-                try:
-                    st = os.lstat(full)
-                    is_dir = stat_module.S_ISDIR(st.st_mode)
-                    entries.append(FileEntry(name, is_dir, st.st_size, st.st_mtime, full))
-                except OSError:
-                    continue
-        except OSError as e:
-            raise RuntimeError(str(e))
-        entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
-        return entries
-
-    def chdir(self, path):
-        self.cwd = os.path.abspath(path)
-
-    def cd_up(self):
-        self.cwd = os.path.dirname(self.cwd.rstrip("/")) or "/"
-
-    def mkdir(self, name):
-        os.mkdir(os.path.join(self.cwd, name))
-
-    def remove(self, entry: FileEntry):
-        if entry.is_dir:
-            os.rmdir(entry.path)
-        else:
-            os.remove(entry.path)
-
-    def open_read(self, path):
-        return open(path, "rb")
-
-    def open_write(self, path):
-        return open(path, "wb")
-
-    def close(self):
-        pass
-
-    def label(self):
-        return f"Local: {self.cwd}"
-
-
-# ---------- Плитка хоста ----------
 class _HostChoiceTile(QFrame):
     def __init__(self, title, subtitle, is_local=False, parent=None):
         super().__init__(parent)
@@ -157,7 +91,6 @@ class _HostChoiceTile(QFrame):
         row.addLayout(text_col, 1)
 
 
-# ---------- Страница выбора хоста ----------
 class _HostPicker(QWidget):
     def __init__(self, store, on_choose, parent=None):
         super().__init__(parent)
@@ -198,7 +131,6 @@ class _HostPicker(QWidget):
             if w:
                 w.deleteLater()
 
-
         names = self.store.names()
         for i, name in enumerate(names, start=0):
             info = self.store.get(name) or {}
@@ -214,7 +146,6 @@ class _HostPicker(QWidget):
             self.tiles_grid.addWidget(tile, row, col)
 
 
-# ---------- Страница файлов ----------
 class _FileView(QWidget):
     def __init__(self, panel, parent=None):
         super().__init__(parent)
@@ -257,7 +188,6 @@ class _FileView(QWidget):
         """)
         self.listw.itemDoubleClicked.connect(self._on_double_click)
 
-        # --- drag & drop ---
         self.listw.setDragEnabled(True)
         self.listw.setAcceptDrops(True)
         self.listw.setDropIndicatorShown(True)
@@ -304,7 +234,6 @@ class _FileView(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
             return
-
         for e in entries:
             text = (f"{'[DIR] ' if e.is_dir else '      '}"
                     f"{e.name:<40s} {_human_size(e.size):>10s}  {_fmt_time(e.mtime)}")
@@ -313,7 +242,6 @@ class _FileView(QWidget):
             if e.is_dir:
                 item.setForeground(QColor("#88c0d0"))
             self.listw.addItem(item)
-
         self.path_label.setText(p.label())
         self.host_label.setText(self.panel.host_name or "—")
 
@@ -414,140 +342,3 @@ class _FileView(QWidget):
             return
         event.acceptProposedAction()
         self.panel.request_drop_from.emit(src_id, self.panel)
-
-
-# ---------- Публичный виджет ----------
-class FilePanel(QWidget):
-    """Стек: выбор хоста плитками → файловый менеджер."""
-
-    request_drop_from = pyqtSignal(int, object)  # (src_panel_id, dst_panel)
-
-    def __init__(self, store, parent=None):
-        super().__init__(parent)
-        self.store = store
-        self.provider = None
-        self.host_name = None
-
-        self.stack = QStackedWidget(self)
-        self.picker = _HostPicker(store, self._on_host_chosen)
-        self.fileview = _FileView(self)
-        self.stack.addWidget(self.picker)
-        self.stack.addWidget(self.fileview)
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(self.stack)
-
-        self.stack.setCurrentIndex(0)
-
-    def _on_host_chosen(self, key, info):
-        if self.provider:
-            try:
-                self.provider.close()
-            except Exception:
-                pass
-            self.provider = None
-
-        if key == "__local__":
-            self.provider = LocalProvider()
-            self.host_name = "Local"
-        else:
-            info = info or {}
-            host = info.get("host", "")
-            port = int(info.get("port", 22))
-            user = info.get("user", "")
-            key_file = info.get("key") or None
-
-            password = _keyring_get(key) if not key_file else None
-            if not key_file and not password:
-                password, ok = QInputDialog.getText(
-                    self, "Пароль SFTP",
-                    f"Пароль для {user}@{host}:",
-                    QLineEdit.EchoMode.Password,
-                )
-                if not ok:
-                    return
-                password = password or None
-
-            try:
-                self.provider = SCPProvider(
-                    host=host, port=port, user=user,
-                    password=password, key=key_file,
-                )
-                self.host_name = key
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка SCP", str(e))
-                self.provider = None
-                return
-
-        self.fileview.refresh()
-        self.stack.setCurrentIndex(1)
-
-    def _return_to_picker(self):
-        if self.provider:
-            try:
-                self.provider.close()
-            except Exception:
-                pass
-            self.provider = None
-        self.host_name = None
-        self.picker.refresh()
-        self.stack.setCurrentIndex(0)
-
-    def refresh(self):
-        if self.stack.currentIndex() == 1:
-            self.fileview.refresh()
-        else:
-            self.picker.refresh()
-
-    def selected_entries(self):
-        return [
-            it.data(Qt.ItemDataRole.UserRole)
-            for it in self.fileview.listw.selectedItems()
-            if it.data(Qt.ItemDataRole.UserRole)
-        ]
-
-    def selected_entry(self):
-        items = self.fileview.listw.selectedItems()
-        if not items:
-            return None
-        return items[0].data(Qt.ItemDataRole.UserRole)
-
-    def other_cwd(self):
-        return self.provider.cwd if self.provider else ""
-
-
-# ---------- Передача файлов ----------
-def transfer_file(src_panel, dst_panel, entry):
-    """Скопировать entry из src_panel в cwd dst_panel. Через /tmp."""
-    import shutil
-    import tempfile
-
-    if not src_panel.provider or not dst_panel.provider:
-        return False
-
-    dst_dir = getattr(dst_panel.provider, "cwd", None)
-    if dst_dir is None:
-        return False
-    dst_path = dst_dir.rstrip("/") + "/" + entry.name
-
-    tmpdir = tempfile.mkdtemp(prefix="freemius_xfer_")
-    local_tmp = os.path.join(tmpdir, entry.name)
-    try:
-        src = src_panel.provider
-        if src.kind == "local":
-            shutil.copy2(entry.path, local_tmp)
-        else:
-            src.get_file(entry.path, local_tmp)
-
-        dst = dst_panel.provider
-        if dst.kind == "local":
-            shutil.copy2(local_tmp, dst_path)
-        else:
-            dst.put_file(local_tmp, dst_path)
-    except Exception as e:
-        QMessageBox.critical(src_panel, "Ошибка передачи", str(e))
-        return False
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    return True
