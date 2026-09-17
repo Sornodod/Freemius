@@ -42,6 +42,9 @@ class TerminalWidget(QWidget):
         self._sel_start = None
         self._sel_end = None
 
+        # буфер незавершённой строки для потокового фильтра мусора
+        self._san_buf = b""
+
         self._cursor_visible = True
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(500)
@@ -78,10 +81,47 @@ class TerminalWidget(QWidget):
         super().resizeEvent(event)
         self._resize_timer.start()
 
+    # ---------- вывод + фильтр ----------
     def feed(self, data: bytes):
-        self.stream.feed(data)
-        self.update()
+        data = self._sanitize_stream(data)
+        if data:
+            self.stream.feed(data)
+            self.update()
 
+    def _sanitize_stream(self, data: bytes) -> bytes:
+        """Потоковый фильтр мусора: работает с чанками, а не со строками.
+
+        bash и sshd могут слать warning «setlocale» и ANSI-мусор кусками,
+        между которыми нет \\n. Поэтому держим накопительный буфер и
+        вырезаем строку целиком, когда она завершится.
+        """
+        buf = self._san_buf + data
+
+        if b"\n" not in buf:
+            self._san_buf = buf
+            # защита от бесконечного роста, если \n так и не придёт
+            if len(self._san_buf) > 64 * 1024:
+                self._san_buf = self._san_buf[-1024:]
+            return b""
+
+        lines = buf.split(b"\n")
+        self._san_buf = lines[-1]  # последняя без \n — оставляем до следующего раза
+        out = []
+        for line in lines[:-1]:
+            out.append(self._filter_line(line) + b"\n")
+        return b"".join(out)
+
+    @staticmethod
+    def _filter_line(line: bytes) -> bytes:
+        """Убирает warning-строки про локаль из одной строки."""
+        low = line.lower()
+        if b"cannot change locale" in low:
+            return b""
+        if b"setlocale" in low and b"warning" in low:
+            return b""
+        return line
+
+    # ---------- палитра ----------
     def _map_color(self, name, bold):
         mapping = {
             "black": 0, "red": 1, "green": 2, "brown": 3, "yellow": 3,
@@ -102,6 +142,7 @@ class TerminalWidget(QWidget):
                 pass
         return DEFAULT_FG
 
+    # ---------- отрисовка ----------
     def paintEvent(self, event):
         painter = QPainter(self)
         cw, ch = self._cell_size()
@@ -147,6 +188,7 @@ class TerminalWidget(QWidget):
             painter.drawRect(QRect(cx * cw, cy * ch, cw, ch))
         painter.end()
 
+    # ---------- выделение ----------
     def _selection_rect(self):
         if self._sel_start is None or self._sel_end is None:
             return None
@@ -198,6 +240,7 @@ class TerminalWidget(QWidget):
             out.append("".join(chars).rstrip())
         return "\n".join(out)
 
+    # ---------- контекстное меню ----------
     def _show_context_menu(self, pos):
         menu = QMenu(self)
         act_copy = QAction("Копировать", self)
@@ -228,6 +271,7 @@ class TerminalWidget(QWidget):
         self._sel_end = (self.screen.lines - 1, self.screen.columns - 1)
         self.update()
 
+    # ---------- ввод ----------
     def keyPressEvent(self, event: QKeyEvent):
         key = event.key()
         text = event.text()

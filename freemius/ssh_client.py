@@ -50,11 +50,39 @@ class SSHClient:
             raise
 
         log.info("TCP-соединение установлено, открываю shell…")
+
+        # Устанавливаем env ДО открытия shell, чтобы сервер не подставил
+        # свои LC_ALL/LANG и не было warning от setlocale.
+        transport = self.client.get_transport()
+        try:
+            transport.set_keepalive(30)
+        except Exception:
+            pass
+        try:
+            # не все серверы разрешают — молча игнорируем
+            transport.global_request(
+                "env", False,
+                LC_ALL="C.UTF-8", LANG="C.UTF-8", LANGUAGE="C",
+            )
+        except Exception as e:
+            log.warning(f"env request failed: {e}")
+
         self.channel = self.client.invoke_shell(
             term="xterm-256color", width=cols, height=rows
         )
         self.channel.settimeout(0.0)
         self._running = True
+
+        # ещё раз попробуем через update_environment (для тех серверов,
+        # что поддерживают sshd AcceptEnv)
+        try:
+            self.channel.update_environment({
+                "LC_ALL": "C.UTF-8",
+                "LANG": "C.UTF-8",
+                "LANGUAGE": "C",
+            })
+        except Exception as e:
+            log.debug(f"update_environment: {e}")
 
         self._reader_thread = threading.Thread(
             target=self._read_loop, daemon=True, name="ssh-reader"

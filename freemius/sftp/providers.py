@@ -1,6 +1,7 @@
-"""Провайдеры файловых систем: локальный и удалённый (SCP)."""
+"""Провайдеры файловых систем: локальный и удалённый (SCP/ssh-cat)."""
 
 import os
+import re
 import shutil
 import stat as stat_module
 import subprocess
@@ -76,6 +77,12 @@ class LocalProvider:
     def open_write(self, path):
         return open(path, "wb")
 
+    def size_of(self, path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
     def close(self):
         pass
 
@@ -87,8 +94,6 @@ class SCPProvider:
     kind = "scp"
 
     def __init__(self, host, port, user, password=None, key=None):
-        if not _which("scp"):
-            raise RuntimeError("Не найден `scp`. Установи openssh-client.")
         if not _which("ssh"):
             raise RuntimeError("Не найден `ssh`. Установи openssh-client.")
 
@@ -100,12 +105,35 @@ class SCPProvider:
 
         self.cwd = self._remote_pwd()
 
+    # ---------- очистка stderr ----------
+    @staticmethod
+    def _clean_stderr(text: str) -> str:
+        if not text:
+            return ""
+        out = []
+        for line in text.splitlines():
+            low = line.lower()
+            if "setlocale" in low and "warning" in low:
+                continue
+            if "cannot change locale" in low:
+                continue
+            line = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line)
+            line = re.sub(r"\\033\[[0-9;?]*[A-Za-z]", "", line)
+            line = re.sub(r"\\e\[[0-9;?]*[A-Za-z]", "", line)
+            if not line.strip():
+                continue
+            out.append(line)
+        return "\n".join(out).strip()
+
+    # ---------- аутентификация ----------
     def _auth_opts(self):
         opts = [
             "-o", "LogLevel=ERROR",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "NumberOfPasswordPrompts=1",
             "-o", "IdentitiesOnly=yes",
+            "-o", "SendEnv=none",
+            "-o", "RequestTTY=no",
         ]
         if self.key:
             opts += [
@@ -128,19 +156,22 @@ class SCPProvider:
     def _ssh_base(self):
         return ["ssh", "-p", str(self.port)] + self._auth_opts()
 
-    def _scp_base(self):
-        return ["scp", "-O", "-P", str(self.port)] + self._auth_opts()
-
+    # ---------- SSH_ASKPASS ----------
     def _askpass_env(self):
+        env = os.environ.copy()
+        env["LC_ALL"] = "C.UTF-8"
+        env["LANG"] = "C.UTF-8"
+        env["LANGUAGE"] = "C"
+
         if not self.password:
-            return None, None
+            return env, None
+
         fd, path = tempfile.mkstemp(prefix="freemius_askpass_", suffix=".sh")
         with os.fdopen(fd, "w") as f:
             f.write("#!/bin/sh\n")
             safe = self.password.replace("'", "'\"'\"'")
             f.write(f"printf '%s\\n' '{safe}'\n")
         os.chmod(path, 0o700)
-        env = os.environ.copy()
         env["SSH_ASKPASS"] = path
         env["SSH_ASKPASS_REQUIRE"] = "force"
         env.setdefault("DISPLAY", ":0")
@@ -162,9 +193,11 @@ class SCPProvider:
                 except Exception:
                     pass
         if check and p.returncode != 0:
-            raise RuntimeError(p.stderr.strip() or f"exit code {p.returncode}")
+            msg = self._clean_stderr(p.stderr) or f"exit code {p.returncode}"
+            raise RuntimeError(msg)
         return p
 
+    # ---------- вспомогательное ----------
     def _remote(self):
         return f"{self.user}@{self.host}"
 
@@ -180,6 +213,19 @@ class SCPProvider:
                 return line
         return "."
 
+    def size_of(self, path):
+        """Размер удалённого файла через ssh stat."""
+        cmd = self._ssh_base() + [
+            self._remote(),
+            f"stat -c %s {self._quote(path)} 2>/dev/null || echo 0",
+        ]
+        try:
+            p = self._run(cmd, check=False, timeout=15)
+            return int((p.stdout or "0").strip().splitlines()[-1])
+        except Exception:
+            return 0
+
+    # ---------- публичный API ----------
     def listdir(self):
         remote = self._remote()
         cmd = self._ssh_base() + [remote, f"ls -la {self._quote(self.cwd)}"]
@@ -205,6 +251,7 @@ class SCPProvider:
                 name = name.split(" -> ", 1)[0]
             if name in (".", ".."):
                 continue
+
             is_dir = perms.startswith("d")
             mtime = 0
             try:
@@ -222,6 +269,7 @@ class SCPProvider:
                         continue
             except Exception:
                 pass
+
             full = self.cwd.rstrip("/") + "/" + name
             entries.append(FileEntry(name, is_dir, size, mtime, full))
 
@@ -244,7 +292,8 @@ class SCPProvider:
         normalized = "/" + "/".join(parts)
 
         cmd = self._ssh_base() + [
-            self._remote(), f"cd {self._quote(normalized)} && pwd",
+            self._remote(),
+            f"cd {self._quote(normalized)} && pwd",
         ]
         p = self._run(cmd, check=True)
         for line in p.stdout.splitlines():
@@ -270,25 +319,96 @@ class SCPProvider:
 
     def remove(self, entry):
         cmd = self._ssh_base() + [
-            self._remote(), f"rm -rf {self._quote(entry.path)}",
+            self._remote(),
+            f"rm -rf {self._quote(entry.path)}",
         ]
         self._run(cmd, check=True)
 
+    # ---------- потоковая передача через ssh+cat ----------
+    def stream_download(self, remote_path, local_path, progress_cb=None):
+        """ssh host cat '<remote>' > local, чанками, с колбэком прогресса."""
+        cmd = self._ssh_base() + [
+            self._remote(),
+            f"cat {self._quote(remote_path)}",
+        ]
+        env, askpass_path = self._askpass_env()
+        try:
+            p = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env, stdin=subprocess.DEVNULL,
+            )
+            total = self.size_of(remote_path) or 0
+            got = 0
+            with open(local_path, "wb") as fout:
+                while True:
+                    chunk = p.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+                    got += len(chunk)
+                    if progress_cb:
+                        progress_cb(got, total)
+            p.wait(timeout=30)
+            if p.returncode != 0:
+                err = (p.stderr.read() or b"").decode("utf-8", "replace")
+                raise RuntimeError(self._clean_stderr(err) or f"exit code {p.returncode}")
+        finally:
+            if askpass_path:
+                try:
+                    os.unlink(askpass_path)
+                except Exception:
+                    pass
+
+    def stream_upload(self, local_path, remote_path, progress_cb=None):
+        """ssh host cat > '<remote>' < local, чанками, с колбэком прогресса."""
+        cmd = self._ssh_base() + [
+            self._remote(),
+            f"cat > {self._quote(remote_path)}",
+        ]
+        env, askpass_path = self._askpass_env()
+        try:
+            p = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env,
+            )
+            try:
+                total = os.path.getsize(local_path)
+            except OSError:
+                total = 0
+            sent = 0
+            with open(local_path, "rb") as fin:
+                while True:
+                    chunk = fin.read(64 * 1024)
+                    if not chunk:
+                        break
+                    p.stdin.write(chunk)
+                    sent += len(chunk)
+                    if progress_cb:
+                        progress_cb(sent, total)
+            p.stdin.close()
+            p.wait(timeout=30)
+            if p.returncode != 0:
+                err = (p.stderr.read() or b"").decode("utf-8", "replace")
+                raise RuntimeError(self._clean_stderr(err) or f"exit code {p.returncode}")
+        finally:
+            if askpass_path:
+                try:
+                    os.unlink(askpass_path)
+                except Exception:
+                    pass
+
+    # --- для совместимости со старым API ---
     def get_file(self, remote_path, local_path):
-        src = f"{self._remote()}:{remote_path}"
-        cmd = self._scp_base() + [src, local_path]
-        self._run(cmd, timeout=600, check=True)
+        self.stream_download(remote_path, local_path)
 
     def put_file(self, local_path, remote_path):
-        dst = f"{self._remote()}:{remote_path}"
-        cmd = self._scp_base() + [local_path, dst]
-        self._run(cmd, timeout=600, check=True)
+        self.stream_upload(local_path, remote_path)
 
     def open_read(self, path):
-        raise NotImplementedError("Use get_file()")
+        raise NotImplementedError
 
     def open_write(self, path):
-        raise NotImplementedError("Use put_file()")
+        raise NotImplementedError
 
     def close(self):
         pass
