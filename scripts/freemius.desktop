@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Freemius
+Comment=SSH/SFTP client
+Exec=freemius
+Icon=freemius
+Categories=Network;
+Terminal=false

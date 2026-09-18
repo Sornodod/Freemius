@@ -1,0 +1,11 @@
+Package: freemius
+Version: 0.2.0
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: libx11-6, libxkbcommon0, libegl1, libgl1, libfontconfig1, libdbus-1-3, libc6
+Maintainer: Sornodod <sornodod@users.noreply.github.com>
+Homepage: https://github.com/Sornodod/Freemius
+Description: Freemius SSH/SFTP client
+ GUI SSH client with terminal emulator, SFTP file transfer,
+ and support for storing connections. Built with PyQt6 + paramiko.
