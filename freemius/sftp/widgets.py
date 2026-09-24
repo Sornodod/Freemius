@@ -197,8 +197,8 @@ class _FileView(QWidget):
         self.listw.setDefaultDropAction(Qt.DropAction.CopyAction)
         self._dragging_entries = []
 
-        self.up_btn = QPushButton("..")
-        self.up_btn.setFixedWidth(40)
+        self.up_btn = QPushButton("Назад")
+        self.up_btn.setToolTip("Перейти в родительскую папку")
         self.up_btn.clicked.connect(self._go_up)
         self.refresh_btn = QPushButton("Обновить")
         self.refresh_btn.clicked.connect(self.refresh)
@@ -232,7 +232,8 @@ class _FileView(QWidget):
         try:
             entries = p.listdir()
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка", str(e))
+            first = str(e).splitlines()[0] if str(e) else "Ошибка"
+            QMessageBox.warning(self, "Ошибка", first)
             return
         for e in entries:
             text = (f"{'[DIR] ' if e.is_dir else '      '}"
@@ -254,13 +255,19 @@ class _FileView(QWidget):
                 self.panel.provider.chdir(e.path)
                 self.refresh()
             except Exception as ex:
-                QMessageBox.critical(self, "Ошибка", str(ex))
+                # показываем только первую значимую строку
+                msg = str(ex).splitlines()[0] if str(ex) else "Ошибка"
+                QMessageBox.warning(self, "Не удалось открыть папку", msg)
 
     def _go_up(self):
         if not self.panel.provider:
             return
-        self.panel.provider.cd_up()
-        self.refresh()
+        try:
+            self.panel.provider.cd_up()
+            self.refresh()
+        except Exception as ex:
+            msg = str(ex).splitlines()[0] if str(ex) else "Ошибка"
+            QMessageBox.warning(self, "Не удалось перейти выше", msg)
 
     def _mkdir(self):
         if not self.panel.provider:
@@ -271,7 +278,8 @@ class _FileView(QWidget):
         try:
             self.panel.provider.mkdir(name.strip())
         except Exception as ex:
-            QMessageBox.critical(self, "Ошибка", str(ex))
+            msg = str(ex).splitlines()[0] if str(ex) else "Ошибка"
+            QMessageBox.warning(self, "Ошибка", msg)
         self.refresh()
 
     def _delete(self):
@@ -286,7 +294,8 @@ class _FileView(QWidget):
             try:
                 self.panel.provider.remove(e)
             except Exception as ex:
-                QMessageBox.critical(self, "Ошибка удаления", f"{e.name}: {ex}")
+                msg = str(ex).splitlines()[0] if str(ex) else "Ошибка"
+                QMessageBox.warning(self, "Ошибка удаления", f"{e.name}: {msg}")
         self.refresh()
 
     # --- drag & drop ---

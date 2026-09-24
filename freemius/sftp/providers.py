@@ -1,4 +1,4 @@
-"""Провайдеры файловых систем: локальный и удалённый (SCP/ssh-cat)."""
+"""Провайдеры файловых систем: локальный и удалённый (SCP/ssh)."""
 
 import os
 import re
@@ -104,6 +104,7 @@ class SCPProvider:
         self.key = key or None
 
         self.cwd = self._remote_pwd()
+        print(f"[SFTP] подключение к {user}@{host}, cwd={self.cwd!r}")
 
     # ---------- очистка stderr ----------
     @staticmethod
@@ -116,6 +117,12 @@ class SCPProvider:
             if "setlocale" in low and "warning" in low:
                 continue
             if "cannot change locale" in low:
+                continue
+            if line.strip().startswith("in function 'cd'"):
+                continue
+            if "builtin cd $argv" in line:
+                continue
+            if line.strip() == "^":
                 continue
             line = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line)
             line = re.sub(r"\\033\[[0-9;?]*[A-Za-z]", "", line)
@@ -204,20 +211,42 @@ class SCPProvider:
     def _quote(self, s):
         return "'" + s.replace("'", "'\"'\"'") + "'"
 
+    def _sh(self, script: str) -> str:
+        """Оборачивает shell-скрипт в /bin/sh -c '<script>'."""
+        return f"/bin/sh -c {self._quote(script)}"
+
     def _remote_pwd(self):
-        cmd = self._ssh_base() + [self._remote(), "pwd"]
-        p = self._run(cmd, check=True)
-        for line in p.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("/"):
-                return line
-        return "."
+        """Определяем домашний каталог на сервере.
+
+        Пробуем несколько вариантов. НЕ возвращаем '.', потому что от
+        этого ломается chdir. Если ничего не вышло — предполагаем
+        /home/<user>.
+        """
+        candidates = [
+            "cd ~ && pwd",
+            "echo $HOME",
+            "cd && pwd",
+            "pwd",
+        ]
+        for script in candidates:
+            cmd = self._ssh_base() + [self._remote(), self._sh(script)]
+            p = self._run(cmd, check=False, timeout=20)
+            for line in p.stdout.splitlines():
+                line = line.strip()
+                # валидный абсолютный путь, не "/" в одиночку
+                if line.startswith("/") and len(line) > 1:
+                    print(f"[SFTP] _remote_pwd: {script!r} → {line}")
+                    return line
+
+        # совсем не смогли — используем стандартную догадку
+        guess = f"/home/{self.user}"
+        print(f"[SFTP] _remote_pwd: все попытки провалились, использую {guess}")
+        return guess
 
     def size_of(self, path):
-        """Размер удалённого файла через ssh stat."""
         cmd = self._ssh_base() + [
             self._remote(),
-            f"stat -c %s {self._quote(path)} 2>/dev/null || echo 0",
+            self._sh(f"stat -c %s {self._quote(path)} 2>/dev/null || echo 0"),
         ]
         try:
             p = self._run(cmd, check=False, timeout=15)
@@ -228,8 +257,14 @@ class SCPProvider:
     # ---------- публичный API ----------
     def listdir(self):
         remote = self._remote()
-        cmd = self._ssh_base() + [remote, f"ls -la {self._quote(self.cwd)}"]
-        p = self._run(cmd, check=True)
+        cmd = self._ssh_base() + [
+            remote,
+            self._sh(f"ls -la {self._quote(self.cwd)}"),
+        ]
+        p = self._run(cmd, check=False)
+        if p.returncode != 0:
+            err = self._clean_stderr(p.stderr) or f"exit code {p.returncode}"
+            raise RuntimeError(f"Не удалось прочитать {self.cwd}: {err}")
 
         entries = []
         for line in p.stdout.splitlines():
@@ -277,6 +312,12 @@ class SCPProvider:
         return entries
 
     def chdir(self, path):
+        # защита: если cwd невалиден (не начинается с /), сбрасываем его
+        if not self.cwd.startswith("/"):
+            print(f"[SFTP] chdir: cwd={self.cwd!r} невалиден, сбрасываю на /home/{self.user}")
+            self.cwd = f"/home/{self.user}"
+
+        # нормализуем путь
         if not path.startswith("/"):
             base = self.cwd.rstrip("/")
             path = f"{base}/{path}"
@@ -291,19 +332,33 @@ class SCPProvider:
                 parts.append(p)
         normalized = "/" + "/".join(parts)
 
-        cmd = self._ssh_base() + [
-            self._remote(),
-            f"cd {self._quote(normalized)} && pwd",
-        ]
-        p = self._run(cmd, check=True)
+        print(f"[SFTP] chdir: cwd={self.cwd!r}, target={normalized!r}")
+
+        inner = f"cd {self._quote(normalized)} && pwd"
+        cmd = self._ssh_base() + [self._remote(), self._sh(inner)]
+        p = self._run(cmd, check=False)
+
+        # если сервер без /bin/sh — fallback на прямой вызов
+        if p.returncode != 0 and "not found" in (p.stderr or "").lower():
+            cmd2 = self._ssh_base() + [self._remote(), inner]
+            p = self._run(cmd2, check=False)
+
+        if p.returncode != 0:
+            err = self._clean_stderr(p.stderr) or p.stdout.strip() or f"exit code {p.returncode}"
+            first = next((l for l in err.splitlines() if l.strip()), err)
+            raise RuntimeError(f"{normalized}: {first}")
+
         for line in p.stdout.splitlines():
             line = line.strip()
-            if line.startswith("/"):
+            if line.startswith("/") and len(line) > 1:
                 self.cwd = line
                 return
-        raise RuntimeError(f"Не удалось перейти в {path}")
+        self.cwd = normalized
 
     def cd_up(self):
+        if not self.cwd.startswith("/"):
+            self.cwd = f"/home/{self.user}"
+            return
         parent = self.cwd.rstrip("/").rsplit("/", 1)[0] or "/"
         try:
             self.chdir(parent)
@@ -313,24 +368,21 @@ class SCPProvider:
     def mkdir(self, name):
         cmd = self._ssh_base() + [
             self._remote(),
-            f"mkdir {self._quote(self.cwd.rstrip('/') + '/' + name)}",
+            self._sh(f"mkdir {self._quote(self.cwd.rstrip('/') + '/' + name)}"),
         ]
         self._run(cmd, check=True)
 
     def remove(self, entry):
         cmd = self._ssh_base() + [
             self._remote(),
-            f"rm -rf {self._quote(entry.path)}",
+            self._sh(f"rm -rf {self._quote(entry.path)}"),
         ]
         self._run(cmd, check=True)
 
-    # ---------- потоковая передача через ssh+cat ----------
+    # ---------- передача файлов через ssh+cat ----------
     def stream_download(self, remote_path, local_path, progress_cb=None):
-        """ssh host cat '<remote>' > local, чанками, с колбэком прогресса."""
-        cmd = self._ssh_base() + [
-            self._remote(),
-            f"cat {self._quote(remote_path)}",
-        ]
+        inner = f"cat {self._quote(remote_path)}"
+        cmd = self._ssh_base() + [self._remote(), self._sh(inner)]
         env, askpass_path = self._askpass_env()
         try:
             p = subprocess.Popen(
@@ -360,11 +412,8 @@ class SCPProvider:
                     pass
 
     def stream_upload(self, local_path, remote_path, progress_cb=None):
-        """ssh host cat > '<remote>' < local, чанками, с колбэком прогресса."""
-        cmd = self._ssh_base() + [
-            self._remote(),
-            f"cat > {self._quote(remote_path)}",
-        ]
+        inner = f"cat > {self._quote(remote_path)}"
+        cmd = self._ssh_base() + [self._remote(), self._sh(inner)]
         env, askpass_path = self._askpass_env()
         try:
             p = subprocess.Popen(
@@ -397,7 +446,7 @@ class SCPProvider:
                 except Exception:
                     pass
 
-    # --- для совместимости со старым API ---
+    # --- совместимость со старым API ---
     def get_file(self, remote_path, local_path):
         self.stream_download(remote_path, local_path)
 
