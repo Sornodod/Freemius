@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QLabel, QMenu, QScrollArea, QFrame, QSizePolicy,
 )
 
+from . import __version__
 from .config import DEFAULT_LOCALHOST_NAME
 from .themes import THEMES
 from .ui_helpers import make_status_icon
@@ -154,10 +155,20 @@ class HomeTab(QWidget):
         scroll.setWidget(self.tiles_host)
         scroll.setStyleSheet("QScrollArea { background: transparent; }")
 
+        # нижняя строка с версией
+        self.version_label = QLabel(f"Freemius v{__version__}")
+        self.version_label.setStyleSheet(
+            "color: #6b7784; padding: 6px 24px; font-size: 11px; background: transparent;"
+        )
+        self.version_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.addLayout(top)
         root.addWidget(scroll, 1)
+        root.addWidget(self.version_label)
 
     def _show_theme_menu(self):
         menu = QMenu(self)

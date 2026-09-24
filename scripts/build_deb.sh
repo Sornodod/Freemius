@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 APP_NAME="freemius"
-APP_VERSION="0.2.0"
+APP_VERSION="$(grep '^Version:' scripts/deb-control | awk '{print $2}')"
 ARCH="amd64"
 
 STAGE="$ROOT/build/deb-stage"
