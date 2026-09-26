@@ -1,9 +1,7 @@
-"""Виджет терминала: рисует pyte-экран QPainter-ом."""
-
-import re
+"""Виджет терминала: pyte-экран, QPainter, скроллбэк, авто-скролл при выделении."""
 
 import pyte
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QPoint
 from PyQt6.QtGui import (
     QFont, QFontDatabase, QKeyEvent, QPainter, QColor, QAction,
 )
@@ -24,13 +22,25 @@ class TerminalWidget(QWidget):
     key_pressed_bytes = pyqtSignal(bytes)
     resized = pyqtSignal(int, int)
 
+    HISTORY_LINES = 5000
+
     def __init__(self, cols=80, rows=24, parent=None):
         super().__init__(parent)
         self.cols = cols
         self.rows = rows
 
-        self.screen = pyte.Screen(columns=cols, lines=rows)
+        self.screen = pyte.HistoryScreen(columns=cols, lines=rows,
+                                          history=self.HISTORY_LINES)
         self.stream = pyte.ByteStream(self.screen)
+
+        self._scroll_offset = 0
+
+        # выделение в АБСОЛЮТНЫХ координатах потока:
+        # abs_row = hist_len + row_in_screen  (для живого экрана)
+        # abs_row = 0..hist_len-1             (для истории)
+        # col = 0..columns-1
+        self._sel_start_abs = None  # (abs_row, col)
+        self._sel_end_abs = None
 
         font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         font.setPointSize(11)
@@ -41,12 +51,7 @@ class TerminalWidget(QWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
 
-        self._sel_start = None
-        self._sel_end = None
-
-        # буфер незавершённой warning-строки
         self._san_buf = b""
-
         self._cursor_visible = True
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(500)
@@ -57,6 +62,13 @@ class TerminalWidget(QWidget):
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(50)
         self._resize_timer.timeout.connect(self._recompute_grid)
+
+        # авто-скролл при выделении: таймер + направление
+        self._autoscroll_dir = 0   # -1 вверх, +1 вниз, 0 стоп
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.setInterval(50)
+        self._autoscroll_timer.timeout.connect(self._autoscroll_tick)
+        self._autoscroll_lines = 1  # сколько строк за тик
 
     def _blink(self):
         self._cursor_visible = not self._cursor_visible
@@ -76,6 +88,7 @@ class TerminalWidget(QWidget):
             return
         self.cols, self.rows = w, h
         self.screen.resize(lines=h, columns=w)
+        self._scroll_offset = 0
         self.resized.emit(w, h)
         self.update()
 
@@ -83,28 +96,23 @@ class TerminalWidget(QWidget):
         super().resizeEvent(event)
         self._resize_timer.start()
 
-    # ---------- вывод + фильтр мусора ----------
     def feed(self, data: bytes):
         data = self._sanitize_stream(data)
         if data:
+            was_at_bottom = (self._scroll_offset == 0)
             self.stream.feed(data)
+            if was_at_bottom:
+                self._scroll_offset = 0
             self.update()
 
     def _sanitize_stream(self, data: bytes) -> bytes:
-        """Потоковый фильтр: режет warning про setlocale, всё остальное
-        отдаёт в pyte НЕМЕДЛЕННО, без буферизации по строкам.
-
-        Это критично для эха ввода — сервер шлёт эхо по одному символу
-        без \\n, и если буферизовать до \\n, ввод не отображается.
-        """
         buf = self._san_buf + data
         self._san_buf = b""
 
-        # быстрый путь: если warning'а нет — отдаём всё как есть
         if b"cannot change locale" not in buf and b"setlocale" not in buf:
             return buf
 
-        # медленный путь: вырезаем warning-строки
+        import re
         out = re.sub(
             rb"/bin/bash:\s*warning:\s*setlocale:[^\r\n]*[\r\n]*",
             b"",
@@ -115,17 +123,94 @@ class TerminalWidget(QWidget):
             b"",
             out,
         )
-
-        # если на конце висит незакрытый кусок, похожий на начало warning'а,
-        # отложим его до следующего чанка
-        tail = out[-200:] if len(out) > 200 else out
-        if b"setlocale" in tail.lower() and b"\n" not in tail:
-            nl = out.rfind(b"\n")
-            if nl >= 0:
-                self._san_buf = out[nl + 1:]
-                return out[:nl + 1]
-
         return out
+
+    # ---------- координаты ----------
+    def _history_len(self):
+        return len(self.screen.history.top)
+
+    def _max_scroll(self):
+        return self._history_len()
+
+    def _abs_from_screen_row(self, screen_row: int) -> int:
+        """Абсолютная строка потока для видимой строки."""
+        return self._history_len() + screen_row
+
+    def _screen_from_abs(self, abs_row: int):
+        """Возвращает ('screen'|'history', index) для абсолютной строки."""
+        hist_len = self._history_len()
+        if abs_row < hist_len:
+            return ("history", abs_row)
+        return ("screen", abs_row - hist_len)
+
+    def _get_line_by_abs(self, abs_row: int):
+        where, idx = self._screen_from_abs(abs_row)
+        if where == "history":
+            try:
+                return self.screen.history.top[idx]
+            except IndexError:
+                return None
+        else:
+            if 0 <= idx < self.screen.lines:
+                return self.screen.buffer[idx]
+            return None
+
+    # ---------- скролл ----------
+    def scroll_up(self, lines=1):
+        new = min(self._scroll_offset + lines, self._max_scroll())
+        if new != self._scroll_offset:
+            self._scroll_offset = new
+            self.update()
+
+    def scroll_down(self, lines=1):
+        new = max(0, self._scroll_offset - lines)
+        if new != self._scroll_offset:
+            self._scroll_offset = new
+            self.update()
+
+    def scroll_to_bottom(self):
+        if self._scroll_offset != 0:
+            self._scroll_offset = 0
+            self.update()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.scroll_up(3)
+        elif delta < 0:
+            self.scroll_down(3)
+        event.accept()
+
+    # ---------- автоскролл при выделении ----------
+    def _autoscroll_tick(self):
+        if self._autoscroll_dir == 0:
+            self._autoscroll_timer.stop()
+            return
+        if self._autoscroll_dir < 0:
+            self.scroll_up(self._autoscroll_lines)
+        else:
+            self.scroll_down(self._autoscroll_lines)
+
+        # расширяем выделение до верхней/нижней видимой строки
+        if self._sel_end_abs is not None:
+            if self._autoscroll_dir < 0:
+                # мы ушли вверх — выделение тянется к верхней строке
+                new_abs = self._history_len() - self._scroll_offset
+            else:
+                # вниз — к нижней
+                new_abs = self._history_len() - self._scroll_offset + self.screen.lines - 1
+            # обновим только строку, столбец — тот, что был при последнем движении
+            self._sel_end_abs = (new_abs, self._sel_end_abs[1])
+        self.update()
+
+    def _start_autoscroll(self, direction: int):
+        self._autoscroll_dir = direction
+        if not self._autoscroll_timer.isActive():
+            self._autoscroll_timer.start()
+
+    def _stop_autoscroll(self):
+        self._autoscroll_dir = 0
+        self._autoscroll_timer.stop()
 
     # ---------- палитра ----------
     def _map_color(self, name, bold):
@@ -149,27 +234,50 @@ class TerminalWidget(QWidget):
         return DEFAULT_FG
 
     # ---------- отрисовка ----------
+    def _visible_abs_start(self):
+        """Абсолютная строка, которая отображается в самой верхней видимой позиции."""
+        return self._history_len() - self._scroll_offset
+
+    def _selection_abs_range(self):
+        """Возвращает (start_abs, start_col, end_abs, end_col) или None."""
+        if self._sel_start_abs is None or self._sel_end_abs is None:
+            return None
+        a, b = self._sel_start_abs, self._sel_end_abs
+        if a <= b:
+            return (a[0], a[1], b[0], b[1])
+        return (b[0], b[1], a[0], a[1])
+
     def paintEvent(self, event):
         painter = QPainter(self)
         cw, ch = self._cell_size()
         fm = self.fontMetrics()
         painter.fillRect(self.rect(), DEFAULT_BG)
 
-        sel = self._selection_rect()
+        abs_top = self._visible_abs_start()
+
+        # выделение рисуем поверх строк
+        sel = self._selection_abs_range()
+
+        # сначала фон выделения
         if sel:
             r0, c0, r1, c1 = sel
-            for row in range(r0, r1 + 1):
-                cstart = c0 if row == r0 else 0
-                cend = c1 if row == r1 else self.screen.columns - 1
+            for abs_row in range(r0, r1 + 1):
+                screen_row = abs_row - abs_top
+                if screen_row < 0 or screen_row >= self.screen.lines:
+                    continue
+                cstart = c0 if abs_row == r0 else 0
+                cend = c1 if abs_row == r1 else self.screen.columns - 1
                 painter.fillRect(
-                    QRect(cstart * cw, row * ch,
+                    QRect(cstart * cw, screen_row * ch,
                           (cend - cstart + 1) * cw, ch),
                     SELECT_BG,
                 )
 
-        buffer = self.screen.buffer
-        for y in range(self.screen.lines):
-            line = buffer.get(y, {})
+        for screen_row in range(self.screen.lines):
+            abs_row = abs_top + screen_row
+            line = self._get_line_by_abs(abs_row)
+            if line is None:
+                continue
             for x in range(self.screen.columns):
                 char = line.get(x)
                 if char is None:
@@ -179,7 +287,7 @@ class TerminalWidget(QWidget):
                     continue
                 fg = DEFAULT_FG if char.fg == "default" else self._map_color(char.fg, char.bold)
                 bg = DEFAULT_BG if char.bg == "default" else self._map_color(char.bg, False)
-                x_px, y_px = x * cw, y * ch
+                x_px, y_px = x * cw, screen_row * ch
                 if bg != DEFAULT_BG:
                     painter.fillRect(QRect(x_px, y_px, cw, ch), bg)
                 if ch_.strip() == "":
@@ -187,23 +295,22 @@ class TerminalWidget(QWidget):
                 painter.setPen(fg)
                 painter.drawText(x_px, y_px + fm.ascent(), ch_)
 
-        if self.hasFocus() and self._cursor_visible:
+        if self.hasFocus() and self._cursor_visible and self._scroll_offset == 0:
             cx, cy = self.screen.cursor.x, self.screen.cursor.y
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(DEFAULT_FG)
             painter.drawRect(QRect(cx * cw, cy * ch, cw, ch))
+
+        # индикатор, что мы не внизу
+        if self._scroll_offset > 0:
+            painter.setBrush(QColor("#d7a13c"))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRect(QRect(0, 0, self.width(), 3))
+
         painter.end()
 
-    # ---------- выделение ----------
-    def _selection_rect(self):
-        if self._sel_start is None or self._sel_end is None:
-            return None
-        a, b = self._sel_start, self._sel_end
-        if a <= b:
-            return (a[0], a[1], b[0], b[1])
-        return (b[0], b[1], a[0], a[1])
-
-    def _cell_at(self, pos):
+    # ---------- мышь ----------
+    def _cell_at(self, pos: QPoint):
         cw, ch = self._cell_size()
         if cw <= 0 or ch <= 0:
             return None
@@ -215,36 +322,72 @@ class TerminalWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             cell = self._cell_at(event.position().toPoint())
             if cell:
-                self._sel_start = cell
-                self._sel_end = cell
+                screen_row, col = cell
+                abs_row = self._abs_from_screen_row(screen_row)
+                self._sel_start_abs = (abs_row, col)
+                self._sel_end_abs = (abs_row, col)
                 self.update()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.MouseButton.LeftButton and self._sel_start is not None:
-            cell = self._cell_at(event.position().toPoint())
-            if cell:
-                self._sel_end = cell
-                self.update()
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            super().mouseMoveEvent(event)
+            return
+
+        if self._sel_start_abs is None:
+            super().mouseMoveEvent(event)
+            return
+
+        pos = event.position().toPoint()
+        cw, ch = self._cell_size()
+        if cw <= 0 or ch <= 0:
+            super().mouseMoveEvent(event)
+            return
+
+        # определяем, за границей ли мышь
+        if pos.y() < 0:
+            self._start_autoscroll(-1)
+            # не трогаем _sel_end_abs — таймер сам расширит
+        elif pos.y() >= self.height():
+            self._start_autoscroll(+1)
+        else:
+            self._stop_autoscroll()
+            # мышь внутри — обновляем _sel_end_abs
+            x = min(max(0, pos.x() // cw), self.screen.columns - 1)
+            y = min(max(0, pos.y() // ch), self.screen.lines - 1)
+            abs_row = self._abs_from_screen_row(y)
+            self._sel_end_abs = (abs_row, x)
+            self.update()
+
         super().mouseMoveEvent(event)
 
+    def mouseReleaseEvent(self, event):
+        self._stop_autoscroll()
+        super().mouseReleaseEvent(event)
+
     def selected_text(self) -> str:
-        sel = self._selection_rect()
+        sel = self._selection_abs_range()
         if not sel:
             return ""
         r0, c0, r1, c1 = sel
-        buffer = self.screen.buffer
         out = []
-        for row in range(r0, r1 + 1):
-            line = buffer.get(row, {})
-            cstart = c0 if row == r0 else 0
-            cend = c1 if row == r1 else self.screen.columns - 1
+        for abs_row in range(r0, r1 + 1):
+            line = self._get_line_by_abs(abs_row)
+            if line is None:
+                out.append("")
+                continue
+            cstart = c0 if abs_row == r0 else 0
+            cend = c1 if abs_row == r1 else self.screen.columns - 1
             chars = []
             for col in range(cstart, cend + 1):
                 char = line.get(col)
                 chars.append(char.data if char and char.data else " ")
             out.append("".join(chars).rstrip())
         return "\n".join(out)
+
+    def _clear_selection(self):
+        self._sel_start_abs = None
+        self._sel_end_abs = None
 
     # ---------- контекстное меню ----------
     def _show_context_menu(self, pos):
@@ -273,8 +416,10 @@ class TerminalWidget(QWidget):
             self.key_pressed_bytes.emit(text.encode("utf-8"))
 
     def _select_all(self):
-        self._sel_start = (0, 0)
-        self._sel_end = (self.screen.lines - 1, self.screen.columns - 1)
+        """Выделить всё, что есть — историю + экран."""
+        self._sel_start_abs = (0, 0)
+        last_abs = self._history_len() + self.screen.lines - 1
+        self._sel_end_abs = (last_abs, self.screen.columns - 1)
         self.update()
 
     # ---------- ввод ----------
@@ -282,6 +427,36 @@ class TerminalWidget(QWidget):
         key = event.key()
         text = event.text()
         mods = event.modifiers()
+
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            if key == Qt.Key.Key_PageUp:
+                self.scroll_up(self.screen.lines - 1)
+                return
+            if key == Qt.Key.Key_PageDown:
+                self.scroll_down(self.screen.lines - 1)
+                return
+            if key == Qt.Key.Key_Up:
+                self.scroll_up(1)
+                return
+            if key == Qt.Key.Key_Down:
+                self.scroll_down(1)
+                return
+            if key == Qt.Key.Key_Home:
+                self.scroll_up(self._max_scroll())
+                return
+            if key == Qt.Key.Key_End:
+                self.scroll_to_bottom()
+                return
+
+        if key == Qt.Key.Key_PageUp:
+            self.scroll_up(self.screen.lines - 1)
+            return
+        if key == Qt.Key.Key_PageDown:
+            self.scroll_down(self.screen.lines - 1)
+            return
+
+        if self._scroll_offset != 0:
+            self.scroll_to_bottom()
 
         if mods & Qt.KeyboardModifier.ControlModifier and mods & Qt.KeyboardModifier.ShiftModifier:
             if key == Qt.Key.Key_C:
@@ -301,7 +476,6 @@ class TerminalWidget(QWidget):
             Qt.Key.Key_Up: b"\x1b[A", Qt.Key.Key_Down: b"\x1b[B",
             Qt.Key.Key_Right: b"\x1b[C", Qt.Key.Key_Left: b"\x1b[D",
             Qt.Key.Key_Home: b"\x1b[H", Qt.Key.Key_End: b"\x1b[F",
-            Qt.Key.Key_PageUp: b"\x1b[5~", Qt.Key.Key_PageDown: b"\x1b[6~",
             Qt.Key.Key_Insert: b"\x1b[2~", Qt.Key.Key_Delete: b"\x1b[3~",
             Qt.Key.Key_F1: b"\x1bOP", Qt.Key.Key_F2: b"\x1bOQ",
             Qt.Key.Key_F3: b"\x1bOR", Qt.Key.Key_F4: b"\x1bOS",
@@ -309,7 +483,7 @@ class TerminalWidget(QWidget):
         }
         if key in mapping:
             self.key_pressed_bytes.emit(mapping[key])
-            self._sel_start = self._sel_end = None
+            self._clear_selection()
             self.update()
             return
 
@@ -317,11 +491,11 @@ class TerminalWidget(QWidget):
             ch = text.lower()
             if "a" <= ch <= "z":
                 self.key_pressed_bytes.emit(bytes([ord(ch) - 96]))
-                self._sel_start = self._sel_end = None
+                self._clear_selection()
                 self.update()
                 return
 
         if text:
             self.key_pressed_bytes.emit(text.encode("utf-8"))
-            self._sel_start = self._sel_end = None
+            self._clear_selection()
             self.update()
